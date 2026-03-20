@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pocketbase import PocketBase
 
+from modbus_service import FroniusModbusClient
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -87,6 +89,14 @@ async def poll_and_store_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Modbus-Verbindungstest beim Start
+    modbus = FroniusModbusClient()
+    result = await modbus.test_connection()
+    if result["success"]:
+        logger.info("Modbus-Test erfolgreich: %s", result)
+    else:
+        logger.warning("Modbus-Test fehlgeschlagen: %s", result)
+
     task = asyncio.create_task(poll_and_store_data())
     yield
     task.cancel()
@@ -158,4 +168,23 @@ async def get_powerflow():
         return JSONResponse(
             status_code=502,
             content={"error": f"Wechselrichter-Fehler: {e.response.status_code}"},
+        )
+
+
+@app.get("/api/battery/status")
+async def get_battery_status():
+    try:
+        modbus = FroniusModbusClient()
+        result = await modbus.get_battery_status()
+        if not result.get("success"):
+            return JSONResponse(
+                status_code=503,
+                content=result,
+            )
+        return result
+    except Exception:
+        logger.exception("Fehler beim Abrufen des Batterie-Status")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": "Interner Fehler"},
         )
