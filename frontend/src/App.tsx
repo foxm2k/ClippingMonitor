@@ -24,9 +24,21 @@ interface PowerLog {
   battery_soc: number;
 }
 
+interface BatteryStatus {
+  success: boolean;
+  id_check: number;
+  wchamax_watt: number;
+  charge_limit_pct: number;
+  discharge_limit_pct: number;
+  charge_limit_watt: number;
+  discharge_limit_watt: number;
+  reserve_pct: number;
+  control_mode: number;
+}
+
 function formatPower(watts: number): { value: string; unit: string } {
   if (Math.abs(watts) >= 1000) {
-    return { value: (watts / 1000).toFixed(2), unit: "kW" };
+    return { value: (watts / 1000).toFixed(1), unit: "kW" };
   }
   return { value: Math.round(watts).toString(), unit: "W" };
 }
@@ -85,22 +97,31 @@ function StatCard({
 export default function App() {
   const [history, setHistory] = useState<PowerLog[]>([]);
   const [live, setLive] = useState<PowerLog | null>(null);
+  const [battery, setBattery] = useState<BatteryStatus | null>(null);
 
   useEffect(() => {
-    const fetchHistory = async () => {
-      try {
-        const res = await api.get<PowerLog[]>("/api/history");
-        setHistory(res.data);
-        if (res.data.length > 0) {
-          setLive(res.data[res.data.length - 1]);
+    const fetchAll = async () => {
+      const [historyResult, batteryResult] = await Promise.allSettled([
+        api.get<PowerLog[]>("/api/history"),
+        api.get<BatteryStatus>("/api/battery/status"),
+      ]);
+
+      if (historyResult.status === "fulfilled") {
+        setHistory(historyResult.value.data);
+        if (historyResult.value.data.length > 0) {
+          setLive(historyResult.value.data[historyResult.value.data.length - 1]);
         }
-      } catch (err) {
-        console.error("History-Abruf fehlgeschlagen", err);
+      } else {
+        console.error("History-Abruf fehlgeschlagen", historyResult.reason);
+      }
+
+      if (batteryResult.status === "fulfilled" && batteryResult.value.data.success) {
+        setBattery(batteryResult.value.data);
       }
     };
 
-    fetchHistory();
-    const interval = setInterval(fetchHistory, 60_000);
+    fetchAll();
+    const interval = setInterval(fetchAll, 60_000);
     return () => clearInterval(interval);
   }, []);
 
@@ -115,6 +136,16 @@ export default function App() {
 
   const pvFormatted = formatPower(live?.pv_power ?? 0);
   const loadFormatted = formatPower(live?.load_power ?? 0);
+
+  const controlModeLabels: Record<number, string> = {
+    0: "Limits aus",
+    1: "Ladelimit",
+    2: "Entladelimit",
+    3: "Lade + Entladelimit",
+  };
+
+  const chargeLimitWatt = battery?.charge_limit_watt ?? 0;
+  const dischargeLimitWatt = battery?.discharge_limit_watt ?? 0;
 
 
   return (
@@ -227,6 +258,53 @@ export default function App() {
           </ComposedChart>
         </ResponsiveContainer>
       </div>
+
+      {/* Modbus Batterie-Steuerung */}
+      {battery && (
+        <div className="rounded-2xl bg-slate-800 p-6 mt-6">
+          <h2 className="text-lg font-semibold text-white mb-4">
+            Modbus Batterie-Steuerung
+          </h2>
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+            <div className="rounded-xl bg-slate-700/50 p-4">
+              <div className="text-xs text-slate-400 mb-1">Max. Ladeleistung</div>
+              <div className="text-lg font-semibold text-white">
+                {formatPowerString(battery.wchamax_watt)}
+              </div>
+            </div>
+            <div className="rounded-xl bg-slate-700/50 p-4">
+              <div className="text-xs text-slate-400 mb-1">Ladelimit</div>
+              <div className="text-lg font-semibold text-emerald-400">
+                {Math.abs(battery.charge_limit_pct).toFixed(1)} %
+              </div>
+              <div className="text-xs text-slate-400 mt-1">
+                = {formatPowerString(chargeLimitWatt)}
+              </div>
+            </div>
+            <div className="rounded-xl bg-slate-700/50 p-4">
+              <div className="text-xs text-slate-400 mb-1">Entladelimit</div>
+              <div className="text-lg font-semibold text-orange-400">
+                {Math.abs(battery.discharge_limit_pct).toFixed(1)} %
+              </div>
+              <div className="text-xs text-slate-400 mt-1">
+                = {formatPowerString(dischargeLimitWatt)}
+              </div>
+            </div>
+            <div className="rounded-xl bg-slate-700/50 p-4">
+              <div className="text-xs text-slate-400 mb-1">Reserve</div>
+              <div className="text-lg font-semibold text-sky-400">
+                {battery.reserve_pct.toFixed(1)} %
+              </div>
+            </div>
+            <div className="rounded-xl bg-slate-700/50 p-4">
+              <div className="text-xs text-slate-400 mb-1">Steuerungsmodus</div>
+              <div className="text-lg font-semibold text-white">
+                {controlModeLabels[battery.control_mode] ?? `Modus ${battery.control_mode}`}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
