@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  LineChart,
+  ComposedChart,
   Line,
   XAxis,
   YAxis,
@@ -8,6 +8,8 @@ import {
   Tooltip,
   ResponsiveContainer,
   Legend,
+  ReferenceLine,
+  ReferenceArea,
 } from "recharts";
 import { Sun, Home, Zap, Battery } from "lucide-react";
 import api from "./api";
@@ -22,11 +24,30 @@ interface PowerLog {
   battery_soc: number;
 }
 
+function formatPower(watts: number): { value: string; unit: string } {
+  if (Math.abs(watts) >= 1000) {
+    return { value: (watts / 1000).toFixed(2), unit: "kW" };
+  }
+  return { value: Math.round(watts).toString(), unit: "W" };
+}
+
+function formatPowerString(watts: number): string {
+  const { value, unit } = formatPower(watts);
+  return `${value} ${unit}`;
+}
+
 function formatTime(iso: string) {
   return new Date(iso).toLocaleTimeString("de-AT", {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function yAxisTickFormatter(val: number): string {
+  if (Math.abs(val) >= 1000) {
+    return `${(val / 1000).toFixed(1)} kW`;
+  }
+  return `${val} W`;
 }
 
 function StatCard({
@@ -35,12 +56,14 @@ function StatCard({
   value,
   unit,
   color,
+  extra,
 }: {
   icon: React.ReactNode;
   label: string;
-  value: number;
+  value: string;
   unit: string;
   color: string;
+  extra?: string;
 }) {
   return (
     <div className="rounded-2xl bg-slate-800 p-5 flex flex-col gap-2">
@@ -49,9 +72,12 @@ function StatCard({
         {label}
       </div>
       <div className="text-2xl font-semibold text-white">
-        {value.toFixed(0)}{" "}
+        {value}{" "}
         <span className="text-sm font-normal text-slate-400">{unit}</span>
       </div>
+      {extra && (
+        <div className="text-sm text-slate-400">{extra}</div>
+      )}
     </div>
   );
 }
@@ -78,6 +104,19 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  const gridPower = live?.grid_power ?? 0;
+  const gridLabel = gridPower >= 0 ? "Netzbezug" : "Einspeisung";
+  const gridFormatted = formatPower(Math.abs(gridPower));
+
+  const battPower = live?.battery_power ?? 0;
+  const battLabel = battPower >= 0 ? "Batterie entlädt" : "Batterie lädt";
+  const battFormatted = formatPower(Math.abs(battPower));
+  const battSoc = live?.battery_soc ?? 0;
+
+  const pvFormatted = formatPower(live?.pv_power ?? 0);
+  const loadFormatted = formatPower(live?.load_power ?? 0);
+
+
   return (
     <div className="min-h-screen bg-slate-900 p-6 md:p-10">
       <h1 className="text-2xl font-bold text-white mb-8">
@@ -89,40 +128,41 @@ export default function App() {
         <StatCard
           icon={<Sun size={20} />}
           label="PV-Erzeugung"
-          value={live?.pv_power ?? 0}
-          unit="W"
+          value={pvFormatted.value}
+          unit={pvFormatted.unit}
           color="#facc15"
         />
         <StatCard
           icon={<Home size={20} />}
           label="Hausverbrauch"
-          value={live?.load_power ?? 0}
-          unit="W"
+          value={loadFormatted.value}
+          unit={loadFormatted.unit}
           color="#38bdf8"
         />
         <StatCard
           icon={<Zap size={20} />}
-          label="Netz"
-          value={live?.grid_power ?? 0}
-          unit="W"
+          label={gridLabel}
+          value={gridFormatted.value}
+          unit={gridFormatted.unit}
           color="#a78bfa"
         />
         <StatCard
           icon={<Battery size={20} />}
-          label="Batterie"
-          value={live?.battery_soc ?? 0}
-          unit="%"
+          label={battLabel}
+          value={battFormatted.value}
+          unit={battFormatted.unit}
           color="#4ade80"
+          extra={`Ladestand: ${battSoc.toFixed(0)} %`}
         />
       </div>
 
       {/* Chart */}
-      <div className="rounded-2xl bg-slate-800 p-5">
+      <div className="rounded-2xl bg-slate-900 p-5">
         <h2 className="text-lg font-semibold text-white mb-4">
           Verlauf (letzte 24 h)
         </h2>
         <ResponsiveContainer width="100%" height={400}>
-          <LineChart data={history}>
+          <ComposedChart data={history}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
             <XAxis
               dataKey="created"
@@ -130,7 +170,18 @@ export default function App() {
               stroke="#64748b"
               tick={{ fontSize: 12 }}
             />
-            <YAxis stroke="#64748b" tick={{ fontSize: 12 }} unit=" W" />
+            <YAxis
+              stroke="#64748b"
+              tick={{ fontSize: 12 }}
+              tickFormatter={yAxisTickFormatter}
+            />
+            <ReferenceArea
+              y1={0}
+              ifOverflow="hidden"
+              fill="rgba(185, 28, 28, 0.15)"
+              strokeOpacity={0}
+            />
+            <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
             <Tooltip
               contentStyle={{
                 backgroundColor: "#1e293b",
@@ -138,6 +189,7 @@ export default function App() {
                 borderRadius: 8,
               }}
               labelFormatter={formatTime}
+              formatter={(value: number) => formatPowerString(value)}
             />
             <Legend />
             <Line
@@ -172,7 +224,7 @@ export default function App() {
               dot={false}
               strokeWidth={2}
             />
-          </LineChart>
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
     </div>
