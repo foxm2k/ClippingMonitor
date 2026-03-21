@@ -124,7 +124,7 @@ async def get_history():
             pb.collection("power_logs").get_list,
             1,       # page
             1440,    # per_page (24h bei 1-Min-Intervall)
-            {"sort": "created"},
+            {"sort": "-created"},
         )
         records = [
             {
@@ -138,7 +138,7 @@ async def get_history():
             }
             for r in result.items
         ]
-        return records
+        return list(reversed(records))
     except Exception:
         logger.exception("Fehler beim Abrufen der History")
         return JSONResponse(
