@@ -1,12 +1,15 @@
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pocketbase import PocketBase
+from pydantic import BaseModel
 
 from modbus_service import FroniusModbusClient
 
@@ -19,6 +22,14 @@ logger = logging.getLogger(__name__)
 FRONIUS_URL = "http://192.168.123.79/solar_api/v1/GetPowerFlowRealtimeData.fcgi"
 POCKETBASE_URL = "http://127.0.0.1:8090"
 POLL_INTERVAL = 60  # Sekunden
+SETTINGS_FILE = Path(__file__).parent / "config" / "settings.json"
+
+
+class AppSettings(BaseModel):
+    timezone: str
+    system_capacity_kwp: float
+    export_limit_percent: int
+    auto_control_active: bool
 
 
 def parse_fronius_data(data: dict) -> dict:
@@ -187,4 +198,45 @@ async def get_battery_status():
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": "Interner Fehler"},
+        )
+
+
+@app.get("/api/settings")
+async def get_settings():
+    try:
+        if not SETTINGS_FILE.exists():
+            initial = {
+                "timezone": "Europe/Berlin",
+                "system_capacity_kwp": 0.0,
+                "export_limit_percent": 0,
+                "auto_control_active": False,
+            }
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_FILE.write_text(json.dumps(initial, indent=4), encoding="utf-8")
+            logger.info("settings.json nicht vorhanden – Datei mit Initialwerten angelegt")
+            return AppSettings(**initial)
+        content = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return AppSettings(**content)
+    except Exception:
+        logger.exception("Fehler beim Lesen der Einstellungen")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Einstellungen konnten nicht geladen werden"},
+        )
+
+
+@app.post("/api/settings")
+async def save_settings(settings: AppSettings):
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(
+            json.dumps(settings.model_dump(), indent=4), encoding="utf-8"
+        )
+        logger.info("Einstellungen gespeichert: %s", settings)
+        return settings
+    except Exception:
+        logger.exception("Fehler beim Speichern der Einstellungen")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Einstellungen konnten nicht gespeichert werden"},
         )
