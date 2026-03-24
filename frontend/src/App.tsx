@@ -11,10 +11,10 @@ import {
   ReferenceLine,
   ReferenceArea,
 } from "recharts";
-import { Sun, Home, Zap, Battery, Settings } from "lucide-react";
+import { Sun, Home, Zap, Battery, Settings, Bot } from "lucide-react";
 import api from "./api";
 import type { AppSettings, ForecastPoint, PowerLog, TimeRange } from "./api";
-import { fetchSettings, updateSettings, fetchHistory, fetchForecast, getTimeRange } from "./api";
+import { fetchSettings, updateSettings, fetchHistory, fetchForecast, getTimeRange, setChargeLimit } from "./api";
 
 interface BatteryStatus {
   success: boolean;
@@ -88,36 +88,6 @@ function StatCard({
   );
 }
 
-function ToggleSwitch({
-  checked,
-  onChange,
-  label,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  label: string;
-}) {
-  return (
-    <div className="flex items-center justify-between">
-      <span className="text-sm text-slate-300">{label}</span>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 ${
-          checked ? "bg-sky-500" : "bg-slate-600"
-        }`}
-      >
-        <span
-          className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
-            checked ? "translate-x-6" : "translate-x-1"
-          }`}
-        />
-      </button>
-    </div>
-  );
-}
 
 type FilterMode = "24h" | "today" | "yesterday" | "tomorrow" | "sunwindow";
 
@@ -276,6 +246,128 @@ function mergeChartData(history: PowerLog[], forecast: ForecastPoint[], range: T
   return points;
 }
 
+function ChargeLimitCard({
+  battery,
+  autoControlActive,
+  onLimitApplied,
+  onToggleAutoMode,
+}: {
+  battery: BatteryStatus;
+  autoControlActive: boolean;
+  onLimitApplied: (newPct: number) => void;
+  onToggleAutoMode: (v: boolean) => void;
+}) {
+  const [draft, setDraft] = useState<number | null>(null);
+  const [writing, setWriting] = useState(false);
+  const [localAutoMode, setLocalAutoMode] = useState(autoControlActive);
+
+  useEffect(() => {
+    setLocalAutoMode(autoControlActive);
+  }, [autoControlActive]);
+
+  const handleToggle = (v: boolean) => {
+    setLocalAutoMode(v);
+    setTimeout(() => onToggleAutoMode(v), 0);
+  };
+
+  const displayPct = draft ?? battery.charge_limit_pct;
+
+  const handleApply = async () => {
+    if (draft === null) return;
+    setWriting(true);
+    try {
+      await setChargeLimit(draft);
+      const result = await api.get<BatteryStatus>("/api/battery/status");
+      if (result.data.success) onLimitApplied(result.data.charge_limit_pct);
+      setDraft(null);
+    } catch (err) {
+      console.error("Failed to set charge limit:", err);
+    } finally {
+      setWriting(false);
+    }
+  };
+
+  return (
+    <div
+      className={`col-span-2 lg:col-span-2 rounded-xl p-4 transition-colors border ${
+        localAutoMode
+          ? "bg-sky-900/20 border-sky-500/30"
+          : "bg-slate-700/50 border-transparent"
+      }`}
+    >
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-xs text-slate-400">Ladelimit</div>
+        <div className="flex items-center gap-2">
+          <span className={`text-xs ${localAutoMode ? "text-sky-400" : "text-slate-500"}`}>
+            <Bot size={12} className="inline -mt-0.5 mr-0.5" />
+            KI
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={localAutoMode}
+            onClick={() => handleToggle(!localAutoMode)}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 ${
+              localAutoMode ? "bg-sky-500" : "bg-slate-600"
+            }`}
+          >
+            <span
+              className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                localAutoMode ? "translate-x-[18px]" : "translate-x-[3px]"
+              }`}
+            />
+          </button>
+        </div>
+      </div>
+      <div className="text-2xl font-semibold text-emerald-400 mb-0.5">
+        {displayPct.toFixed(1)} %
+      </div>
+      <div className="text-xs text-slate-400 mb-3">
+        = {formatPowerString((displayPct / 100) * battery.wchamax_watt)}
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        step={1}
+        value={displayPct}
+        onChange={(e) => setDraft(Number(e.target.value))}
+        disabled={localAutoMode || writing}
+        className="w-full accent-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
+      />
+      {localAutoMode && (
+        <div className="text-xs text-sky-400/70 mt-2">
+          Automatik aktiv – Slider gesperrt
+        </div>
+      )}
+      {!localAutoMode && draft !== null && draft !== battery.charge_limit_pct && (
+        <div className="flex gap-2 mt-3">
+          <button
+            onClick={() => setDraft(null)}
+            className="px-3 py-1.5 text-sm rounded-full bg-slate-600/40 text-slate-300 hover:bg-slate-600/60 transition-colors"
+          >
+            Abbrechen
+          </button>
+          <button
+            onClick={handleApply}
+            disabled={writing}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-full bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 transition-colors disabled:opacity-50"
+          >
+            {writing ? (
+              <>
+                <span className="inline-block w-3 h-3 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                Schreibe…
+              </>
+            ) : (
+              "Übernehmen"
+            )}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [chartData, setChartData] = useState<ChartPoint[]>([]);
   const [live, setLive] = useState<PowerLog | null>(null);
@@ -384,6 +476,17 @@ export default function App() {
     await loadChartData(filter, forecastRef.current);
   };
 
+  const handleToggleAutoMode = async (newValue: boolean) => {
+    if (!settings) return;
+    setSettings({ ...settings, auto_control_active: newValue });
+    setSettingsForm((prev) => prev ? { ...prev, auto_control_active: newValue } : prev);
+    try {
+      await updateSettings({ ...settings, auto_control_active: newValue });
+    } catch (e) {
+      console.error("Failed to save auto_control_active:", e);
+    }
+  };
+
   const handleSaveSettings = async () => {
     if (!settingsForm) return;
     setSettingsSaving(true);
@@ -433,7 +536,6 @@ export default function App() {
     3: "Lade + Entladelimit",
   };
 
-  const chargeLimitWatt = battery?.charge_limit_watt ?? 0;
   const dischargeLimitWatt = battery?.discharge_limit_watt ?? 0;
 
   return (
@@ -686,22 +788,19 @@ export default function App() {
               <h2 className="text-lg font-semibold text-white mb-4">
                 Modbus Batterie-Steuerung
               </h2>
-              <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+              <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
                 <div className="rounded-xl bg-slate-700/50 p-4">
                   <div className="text-xs text-slate-400 mb-1">Max. Ladeleistung</div>
                   <div className="text-lg font-semibold text-white">
                     {formatPowerString(battery.wchamax_watt)}
                   </div>
                 </div>
-                <div className="rounded-xl bg-slate-700/50 p-4">
-                  <div className="text-xs text-slate-400 mb-1">Ladelimit</div>
-                  <div className="text-lg font-semibold text-emerald-400">
-                    {Math.abs(battery.charge_limit_pct).toFixed(1)} %
-                  </div>
-                  <div className="text-xs text-slate-400 mt-1">
-                    = {formatPowerString(chargeLimitWatt)}
-                  </div>
-                </div>
+                <ChargeLimitCard
+                  battery={battery}
+                  autoControlActive={settings?.auto_control_active === true}
+                  onLimitApplied={(pct) => setBattery({ ...battery, charge_limit_pct: pct })}
+                  onToggleAutoMode={handleToggleAutoMode}
+                />
                 <div className="rounded-xl bg-slate-700/50 p-4">
                   <div className="text-xs text-slate-400 mb-1">Entladelimit</div>
                   <div className="text-lg font-semibold text-orange-400">
@@ -768,14 +867,6 @@ export default function App() {
                       <option value="UTC">UTC</option>
                     </select>
                   </div>
-
-                  <ToggleSwitch
-                    checked={settingsForm.auto_control_active}
-                    onChange={(v) =>
-                      setSettingsForm({ ...settingsForm, auto_control_active: v })
-                    }
-                    label="Automatische Batteriesteuerung aktiv"
-                  />
 
                   <div className="flex flex-col gap-1.5">
                     <div className="flex items-center justify-between">

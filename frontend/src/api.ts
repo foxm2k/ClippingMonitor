@@ -87,4 +87,8 @@ export async function fetchForecast(): Promise<ForecastPoint[]> {
   return response.data;
 }
 
+export async function setChargeLimit(limitPct: number): Promise<void> {
+  await api.post("/api/battery/charge_limit", { limit_pct: limitPct });
+}
+
 export default api;

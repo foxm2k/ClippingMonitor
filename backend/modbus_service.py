@@ -76,6 +76,94 @@ class FroniusModbusClient:
             client.close()
             logger.info("Modbus-Verbindung geschlossen")
 
+    async def set_charge_limit(self, target_percentage: float) -> dict:
+        """Setzt das Batterieladelimit (InWRte) ueber Modbus TCP.
+
+        target_percentage: Ladelimit in Prozent (z.B. 50.0 fuer 50%).
+        Liest den Scale Factor, berechnet den Rohwert und schreibt ihn.
+        Liest anschliessend StorCtl_Mod und warnt, falls Ladelimit-Bit nicht aktiv.
+        """
+
+        def to_int16(v: int) -> int:
+            return v - 65536 if v > 32767 else v
+
+        client = AsyncModbusTcpClient(self.host, port=self.port)
+
+        try:
+            connected = await client.connect()
+            if not connected:
+                logger.error("Modbus-Verbindung fehlgeschlagen")
+                return {"success": False, "error": "Verbindung fehlgeschlagen"}
+
+            # 1. Scale Factor lesen (Register 40388, int16)
+            sf_result = await client.read_holding_registers(
+                address=40388,
+                count=1,
+                device_id=self.slave_id,
+            )
+            if sf_result.isError():
+                logger.error("Fehler beim Lesen des Scale Factors: %s", sf_result)
+                return {"success": False, "error": f"Scale Factor nicht lesbar: {sf_result}"}
+
+            sf = to_int16(sf_result.registers[0])
+            logger.info("InOutWRte_SF: %d", sf)
+
+            # 2. Rohwert berechnen: raw_value = target_percentage * 10^(-sf)
+            raw_value = int(round(target_percentage * (10 ** -sf)))
+            logger.info(
+                "Schreibe InWRte: %d (%.1f%% mit SF=%d)", raw_value, target_percentage, sf
+            )
+
+            # 3. Ladelimit schreiben (Register 40376, int16)
+            #    int16 negativ → unsigned fuer Modbus-Protokoll
+            write_value = raw_value if raw_value >= 0 else raw_value + 65536
+            write_result = await client.write_register(
+                address=40376,
+                value=write_value,
+                device_id=self.slave_id,
+            )
+            if write_result.isError():
+                logger.error("Fehler beim Schreiben von InWRte: %s", write_result)
+                return {"success": False, "error": f"InWRte Schreibfehler: {write_result}"}
+
+            # 4. StorCtl_Mod lesen (Register 40368, uint16) und Zustand pruefen
+            storctl_result = await client.read_holding_registers(
+                address=40368,
+                count=1,
+                device_id=self.slave_id,
+            )
+            if storctl_result.isError():
+                logger.error("Fehler beim Lesen von StorCtl_Mod: %s", storctl_result)
+                return {"success": False, "error": f"StorCtl_Mod nicht lesbar: {storctl_result}"}
+
+            storctl_mod = storctl_result.registers[0]
+            logger.info("Aktueller StorCtl_Mod: %d", storctl_mod)
+
+            # Bit 0 = Ladelimit aktiv → Modus muss 1 oder 3 sein
+            charge_limit_active = bool(storctl_mod & 1)
+            if not charge_limit_active:
+                logger.warning(
+                    "StorCtl_Mod=%d – Ladelimit-Bit ist NICHT aktiv! "
+                    "Wert wurde geschrieben, aber der WR erzwingt ihn moeglicherweise nicht.",
+                    storctl_mod,
+                )
+
+            return {
+                "success": True,
+                "charge_limit_pct": target_percentage,
+                "raw_value_written": raw_value,
+                "scale_factor": sf,
+                "control_mode": storctl_mod,
+                "charge_limit_active": charge_limit_active,
+            }
+
+        except Exception as e:
+            logger.exception("Modbus-Fehler bei set_charge_limit")
+            return {"success": False, "error": str(e)}
+
+        finally:
+            client.close()
+
     async def get_battery_status(self) -> dict:
         """Liest den SunSpec Storage Control Block (Model 124, int+SF).
         Fronius Verto Plus: Basisadresse 40362 (0-basiert) = Fronius Register 40363."""

@@ -36,6 +36,10 @@ POLL_INTERVAL = 60  # Sekunden
 SETTINGS_FILE = Path(__file__).parent / "config" / "settings.json"
 
 
+class ChargeLimitRequest(BaseModel):
+    limit_pct: float
+
+
 class AppSettings(BaseModel):
     timezone: str = "Europe/Berlin"
     export_limit_percent: int = 0
@@ -236,6 +240,22 @@ async def get_battery_status():
         return result
     except Exception:
         logger.exception("Fehler beim Abrufen des Batterie-Status")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": "Interner Fehler"},
+        )
+
+
+@app.post("/api/battery/charge_limit")
+async def set_charge_limit(request: ChargeLimitRequest):
+    try:
+        modbus = FroniusModbusClient()
+        result = await modbus.set_charge_limit(request.limit_pct)
+        if not result.get("success"):
+            return JSONResponse(status_code=503, content=result)
+        return result
+    except Exception:
+        logger.exception("Fehler beim Setzen des Ladelimits")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": "Interner Fehler"},
