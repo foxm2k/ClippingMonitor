@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ComposedChart,
   Line,
@@ -13,18 +13,8 @@ import {
 } from "recharts";
 import { Sun, Home, Zap, Battery, Settings } from "lucide-react";
 import api from "./api";
-import type { AppSettings } from "./api";
-import { fetchSettings, updateSettings } from "./api";
-
-interface PowerLog {
-  id: string;
-  created: string;
-  pv_power: number;
-  load_power: number;
-  grid_power: number;
-  battery_power: number;
-  battery_soc: number;
-}
+import type { AppSettings, ForecastPoint, PowerLog, TimeRange } from "./api";
+import { fetchSettings, updateSettings, fetchHistory, fetchForecast, getTimeRange } from "./api";
 
 interface BatteryStatus {
   success: boolean;
@@ -129,10 +119,182 @@ function ToggleSwitch({
   );
 }
 
+type FilterMode = "24h" | "today" | "yesterday" | "tomorrow" | "sunwindow";
+
+interface ChartPoint {
+  time: string;
+  pv_power: number | null;
+  load_power: number | null;
+  grid_power: number | null;
+  battery_power: number | null;
+  battery_soc: number | null;
+  expected_kw: number | null;
+}
+
+function calculateEnergyKWh(data: ChartPoint[], key: "pv_power" | "expected_kw"): number {
+  let energyWh = 0;
+  let prevTime: number | null = null;
+  let prevVal: number | null = null;
+
+  for (const pt of data) {
+    const val = pt[key];
+    if (val == null) { prevTime = null; prevVal = null; continue; }
+    const t = new Date(pt.time).getTime();
+    if (prevTime != null && prevVal != null) {
+      const dtMs = t - prevTime;
+      if (dtMs > 0 && dtMs <= 1_800_000) {
+        energyWh += ((prevVal + val) / 2) * (dtMs / 3_600_000);
+      }
+    }
+    prevTime = t;
+    prevVal = val;
+  }
+
+  return energyWh / 1000;
+}
+
+function calculateExcessEnergyKWh(data: ChartPoint[], key: "pv_power" | "expected_kw", limitWatts: number): number {
+  let energyWh = 0;
+  let prevTime: number | null = null;
+  let prevExcess: number | null = null;
+
+  for (const pt of data) {
+    const val = pt[key];
+    if (val == null) { prevTime = null; prevExcess = null; continue; }
+    const excess = Math.max(0, val - limitWatts);
+    const t = new Date(pt.time).getTime();
+    if (prevTime != null && prevExcess != null) {
+      const dtMs = t - prevTime;
+      if (dtMs > 0 && dtMs <= 1_800_000) {
+        energyWh += ((prevExcess + excess) / 2) * (dtMs / 3_600_000);
+      }
+    }
+    prevTime = t;
+    prevExcess = excess;
+  }
+
+  return energyWh / 1000;
+}
+
+function calculateExportedEnergyKWh(data: ChartPoint[]): number {
+  let energyWh = 0;
+  let prevTime: number | null = null;
+  let prevVal: number | null = null;
+
+  for (const pt of data) {
+    if (pt.grid_power == null) { prevTime = null; prevVal = null; continue; }
+    const val = Math.max(0, -pt.grid_power);
+    const t = new Date(pt.time).getTime();
+    if (prevTime != null && prevVal != null) {
+      const dtMs = t - prevTime;
+      if (dtMs > 0 && dtMs <= 1_800_000) {
+        energyWh += ((prevVal + val) / 2) * (dtMs / 3_600_000);
+      }
+    }
+    prevTime = t;
+    prevVal = val;
+  }
+
+  return energyWh / 1000;
+}
+
+function calculateExportExcessEnergyKWh(data: ChartPoint[], limitWatts: number): number {
+  let energyWh = 0;
+  let prevTime: number | null = null;
+  let prevExcess: number | null = null;
+
+  for (const pt of data) {
+    if (pt.grid_power == null) { prevTime = null; prevExcess = null; continue; }
+    const excess = Math.max(0, -pt.grid_power - limitWatts);
+    const t = new Date(pt.time).getTime();
+    if (prevTime != null && prevExcess != null) {
+      const dtMs = t - prevTime;
+      if (dtMs > 0 && dtMs <= 1_800_000) {
+        energyWh += ((prevExcess + excess) / 2) * (dtMs / 3_600_000);
+      }
+    }
+    prevTime = t;
+    prevExcess = excess;
+  }
+
+  return energyWh / 1000;
+}
+
+function mergeChartData(history: PowerLog[], forecast: ForecastPoint[], range: TimeRange): ChartPoint[] {
+  // Open-Meteo liefert "2024-03-22T10:00" (UTC) → key = "2024-03-22T10:00Z"
+  const forecastByHour = new Map<string, number>();
+  for (const f of forecast) {
+    forecastByHour.set(f.time + "Z", f.expected_kw);
+  }
+
+  const rangeStart = new Date(range.start);
+  const rangeEnd = new Date(range.end);
+  const points: ChartPoint[] = [];
+
+  // History points with matched forecast value per hour
+  for (const h of history) {
+    // PocketBase UTC: "2024-03-22T10:05:00.000Z" → match key "2024-03-22T10:00Z"
+    const hourKey = h.created.slice(0, 13) + ":00Z";
+    const fVal = forecastByHour.get(hourKey) ?? null;
+    points.push({
+      time: h.created,
+      pv_power: h.pv_power,
+      load_power: h.load_power,
+      grid_power: h.grid_power,
+      battery_power: h.battery_power,
+      battery_soc: h.battery_soc,
+      expected_kw: fVal !== null ? fVal * 1000 : null,
+    });
+  }
+
+  // Forecast-only points — expanded to minute resolution for uniform x-axis scaling
+  const latestHistory = history.length > 0 ? new Date(history[history.length - 1].created) : rangeStart;
+
+  if (forecastByHour.size > 0) {
+    const startMinute = new Date(latestHistory);
+    startMinute.setSeconds(0, 0);
+    startMinute.setMinutes(startMinute.getMinutes() + 1);
+
+    for (let t = new Date(startMinute); t <= rangeEnd; t = new Date(t.getTime() + 60_000)) {
+      const hourKey = t.toISOString().slice(0, 13) + ":00Z";
+      const fVal = forecastByHour.get(hourKey) ?? null;
+      if (fVal !== null) {
+        points.push({
+          time: t.toISOString(),
+          pv_power: null,
+          load_power: null,
+          grid_power: null,
+          battery_power: null,
+          battery_soc: null,
+          expected_kw: fVal * 1000,
+        });
+      }
+    }
+  }
+
+  points.sort((a, b) => a.time.localeCompare(b.time));
+  return points;
+}
+
 export default function App() {
-  const [history, setHistory] = useState<PowerLog[]>([]);
+  const [chartData, setChartData] = useState<ChartPoint[]>([]);
   const [live, setLive] = useState<PowerLog | null>(null);
   const [battery, setBattery] = useState<BatteryStatus | null>(null);
+  const [activeFilter, setActiveFilter] = useState<FilterMode>("today");
+  const [hiddenLines, setHiddenLines] = useState<Set<string>>(() => {
+    try {
+      const stored = localStorage.getItem("hiddenLines");
+      return stored ? new Set<string>(JSON.parse(stored)) : new Set<string>();
+    } catch {
+      return new Set<string>();
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem("hiddenLines", JSON.stringify([...hiddenLines]));
+  }, [hiddenLines]);
+
+  const activeFilterRef = useRef<FilterMode>("today");
+  const forecastRef = useRef<ForecastPoint[]>([]);
 
   const [tab, setTab] = useState<"dashboard" | "settings">("dashboard");
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -143,38 +305,84 @@ export default function App() {
 
   const formatTime = makeTimeFormatter(settings?.timezone ?? "Europe/Berlin");
 
+  const fetchLive = async () => {
+    const data = await fetchHistory();
+    if (data.length > 0) setLive(data[data.length - 1]);
+  };
+
+  const loadChartData = async (filter: FilterMode, forecastData: ForecastPoint[]) => {
+    let range: TimeRange | undefined;
+
+    if (filter === "sunwindow") {
+      const todayRange = getTimeRange("today");
+      const rangeStart = new Date(todayRange.start);
+      const rangeEnd = new Date(todayRange.end);
+      const todayForecast = forecastData.filter((f) => {
+        const fTime = new Date(f.time + "Z");
+        return fTime >= rangeStart && fTime <= rangeEnd;
+      });
+      const sunPoints = todayForecast.filter((f) => f.expected_kw > 0);
+      if (sunPoints.length > 0) {
+        const first = new Date(sunPoints[0].time + "Z");
+        const last = new Date(sunPoints[sunPoints.length - 1].time + "Z");
+        range = { start: first.toISOString(), end: last.toISOString() };
+      } else {
+        range = getTimeRange("today");
+      }
+    } else {
+      range = getTimeRange(filter);
+    }
+
+    const histData = await fetchHistory(range);
+    setChartData(mergeChartData(histData, forecastData, range!));
+  };
+
   useEffect(() => {
-    const fetchAll = async () => {
-      const [historyResult, batteryResult] = await Promise.allSettled([
-        api.get<PowerLog[]>("/api/history"),
+    const init = async () => {
+      const [forecastResult, batteryResult] = await Promise.allSettled([
+        fetchForecast(),
         api.get<BatteryStatus>("/api/battery/status"),
+        fetchLive(),
       ]);
 
-      if (historyResult.status === "fulfilled") {
-        setHistory(historyResult.value.data);
-        if (historyResult.value.data.length > 0) {
-          setLive(historyResult.value.data[historyResult.value.data.length - 1]);
-        }
-      } else {
-        console.error("History-Abruf fehlgeschlagen", historyResult.reason);
-      }
+      const forecastData = forecastResult.status === "fulfilled" ? forecastResult.value : [];
+      forecastRef.current = forecastData;
 
       if (batteryResult.status === "fulfilled" && batteryResult.value.data.success) {
         setBattery(batteryResult.value.data);
       }
+
+      await loadChartData(activeFilterRef.current, forecastData);
     };
 
     fetchSettings()
-      .then((s) => {
-        setSettings(s);
-        setSettingsForm(s);
-      })
+      .then((s) => { setSettings(s); setSettingsForm(s); })
       .catch((e) => console.error("Settings-Abruf fehlgeschlagen", e));
 
-    fetchAll();
-    const interval = setInterval(fetchAll, 60_000);
+    init();
+    const interval = setInterval(() => {
+      fetchLive();
+      loadChartData(activeFilterRef.current, forecastRef.current);
+    }, 60_000);
     return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const handleLegendClick = (entry: { dataKey?: string | number | ((obj: unknown) => unknown) }) => {
+    if (typeof entry.dataKey !== "string") return;
+    const key = entry.dataKey;
+    setHiddenLines((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  };
+
+  const handleFilterChange = async (filter: FilterMode) => {
+    activeFilterRef.current = filter;
+    setActiveFilter(filter);
+    await loadChartData(filter, forecastRef.current);
+  };
 
   const handleSaveSettings = async () => {
     if (!settingsForm) return;
@@ -203,6 +411,17 @@ export default function App() {
   const battLabel = battPower >= 0 ? "Batterie entlädt" : "Batterie lädt";
   const battFormatted = formatPower(Math.abs(battPower));
   const battSoc = live?.battery_soc ?? 0;
+
+  const exportLimitWatts = settings
+    ? (settings.system_capacity_kwp * 1000) * (settings.export_limit_percent / 100)
+    : null;
+
+  const generatedKWh = calculateEnergyKWh(chartData, "pv_power");
+  const expectedKWh = calculateEnergyKWh(chartData, "expected_kw");
+  const excessKWh = exportLimitWatts != null ? calculateExcessEnergyKWh(chartData, "pv_power", exportLimitWatts) : 0;
+  const expectedExcessKWh = exportLimitWatts != null ? calculateExcessEnergyKWh(chartData, "expected_kw", exportLimitWatts) : 0;
+  const exportedKWh = calculateExportedEnergyKWh(chartData);
+  const exportedExcessKWh = exportLimitWatts != null ? calculateExportExcessEnergyKWh(chartData, exportLimitWatts) : 0;
 
   const pvFormatted = formatPower(live?.pv_power ?? 0);
   const loadFormatted = formatPower(live?.load_power ?? 0);
@@ -281,21 +500,73 @@ export default function App() {
               value={battFormatted.value}
               unit={battFormatted.unit}
               color="#4ade80"
-              extra={`Ladestand: ${battSoc.toFixed(0)} %`}
+              extra={`Ladestand: ${battSoc.toFixed(0)} %${settings && settings.battery_capacity_kwh > 0 ? ` ≈ ${(battSoc / 100 * settings.battery_capacity_kwh).toFixed(1)} kWh` : ""}`}
             />
+          </div>
+
+          {/* Time filter bar */}
+          <div className="flex flex-wrap gap-2 mb-4">
+            {(
+              [
+                { key: "today", label: "Heute" },
+                { key: "24h", label: "Letzte 24h" },
+                { key: "yesterday", label: "Gestern" },
+                { key: "tomorrow", label: "Morgen" },
+                { key: "sunwindow", label: "☀ Sonnenfenster" },
+              ] as { key: FilterMode; label: string }[]
+            ).map(({ key, label }) => (
+              <button
+                key={key}
+                onClick={() => handleFilterChange(key)}
+                className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${
+                  activeFilter === key
+                    ? "bg-amber-400 text-slate-900"
+                    : "bg-slate-700 text-slate-300 hover:bg-slate-600 hover:text-white"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Energy summary */}
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm font-medium bg-slate-800/60 px-5 py-2.5 rounded-xl mb-4">
+            <span className="text-amber-400">
+              ⚡ Erzeugt: {generatedKWh.toFixed(1)} kWh
+            </span>
+            {settings && settings.export_limit_percent < 100 && (
+              <span className="text-red-400">
+                ⚠️ Über Limit: {excessKWh.toFixed(1)} kWh
+              </span>
+            )}
+            <span className="border-l border-slate-600 h-4" />
+            <span className="text-amber-400/50">
+              🌤️ Erwartet: {expectedKWh.toFixed(1)} kWh
+            </span>
+            {settings && settings.export_limit_percent < 100 && (
+              <span className="text-red-400/50">
+                🔮 Erwartet über Limit: {expectedExcessKWh.toFixed(1)} kWh
+              </span>
+            )}
+            <span className="border-l border-slate-600 h-4" />
+            <span className="text-purple-400">
+              🔌 Eingespeist: {exportedKWh.toFixed(1)} kWh
+            </span>
+            {settings && settings.export_limit_percent < 100 && (
+              <span className="text-red-400">
+                🛑 Über Limit: {exportedExcessKWh.toFixed(1)} kWh
+              </span>
+            )}
           </div>
 
           {/* Chart */}
           <div className="rounded-2xl bg-slate-900 p-5">
-            <h2 className="text-lg font-semibold text-white mb-4">
-              Verlauf (letzte 24 h)
-            </h2>
             <ResponsiveContainer width="100%" height={400}>
-              <ComposedChart data={history}>
+              <ComposedChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                 <XAxis
-                  dataKey="created"
-                  tickFormatter={formatTime}
+                  dataKey="time"
+                  tickFormatter={(v: string) => formatTime(v)}
                   stroke="#64748b"
                   tick={{ fontSize: 12 }}
                 />
@@ -311,16 +582,53 @@ export default function App() {
                   strokeOpacity={0}
                 />
                 <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
+                {exportLimitWatts != null &&
+                  settings!.export_limit_percent > 0 &&
+                  !hiddenLines.has("pv_power") && (
+                    <ReferenceLine
+                      y={exportLimitWatts}
+                      stroke="#ef4444"
+                      strokeDasharray="3 3"
+                      strokeOpacity={0.8}
+                      label={{
+                        position: "insideBottomRight",
+                        value: "Erzeugungslimit",
+                        fill: "#ef4444",
+                        fontSize: 12,
+                      }}
+                    />
+                  )}
+                {exportLimitWatts != null &&
+                  settings!.export_limit_percent > 0 &&
+                  !hiddenLines.has("grid_power") && (
+                    <ReferenceLine
+                      y={-exportLimitWatts}
+                      stroke="#ef4444"
+                      strokeDasharray="3 3"
+                      strokeOpacity={0.8}
+                      label={{
+                        position: "insideTopRight",
+                        value: "Einspeiselimit",
+                        fill: "#ef4444",
+                        fontSize: 12,
+                      }}
+                    />
+                  )}
                 <Tooltip
                   contentStyle={{
                     backgroundColor: "#1e293b",
                     border: "1px solid #334155",
                     borderRadius: 8,
                   }}
-                  labelFormatter={formatTime}
-                  formatter={(value: number) => formatPowerString(value)}
+                  labelFormatter={(label: unknown) => formatTime(String(label))}
+                  formatter={(value: unknown, name: unknown) => {
+                    if (name === "Vorhersage PV") {
+                      return [formatPowerString(Number(value)), "Erwartete PV-Leistung"];
+                    }
+                    return [formatPowerString(Number(value)), String(name)];
+                  }}
                 />
-                <Legend />
+                <Legend onClick={handleLegendClick} wrapperStyle={{ cursor: "pointer" }} />
                 <Line
                   type="monotone"
                   dataKey="pv_power"
@@ -328,6 +636,7 @@ export default function App() {
                   stroke="#facc15"
                   dot={false}
                   strokeWidth={2}
+                  hide={hiddenLines.has("pv_power")}
                 />
                 <Line
                   type="monotone"
@@ -336,6 +645,7 @@ export default function App() {
                   stroke="#38bdf8"
                   dot={false}
                   strokeWidth={2}
+                  hide={hiddenLines.has("load_power")}
                 />
                 <Line
                   type="monotone"
@@ -344,6 +654,7 @@ export default function App() {
                   stroke="#a78bfa"
                   dot={false}
                   strokeWidth={2}
+                  hide={hiddenLines.has("grid_power")}
                 />
                 <Line
                   type="monotone"
@@ -352,6 +663,18 @@ export default function App() {
                   stroke="#4ade80"
                   dot={false}
                   strokeWidth={2}
+                  hide={hiddenLines.has("battery_power")}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="expected_kw"
+                  name="Vorhersage PV"
+                  stroke="#fbbf24"
+                  strokeDasharray="5 5"
+                  strokeWidth={2}
+                  dot={false}
+                  connectNulls
+                  hide={hiddenLines.has("expected_kw")}
                 />
               </ComposedChart>
             </ResponsiveContainer>
@@ -393,6 +716,11 @@ export default function App() {
                   <div className="text-lg font-semibold text-sky-400">
                     {battery.reserve_pct.toFixed(1)} %
                   </div>
+                  {settings && settings.battery_capacity_kwh > 0 && (
+                    <div className="text-xs text-slate-400 mt-1">
+                      = {(battery.reserve_pct / 100 * settings.battery_capacity_kwh).toFixed(1)} kWh
+                    </div>
+                  )}
                 </div>
                 <div className="rounded-xl bg-slate-700/50 p-4">
                   <div className="text-xs text-slate-400 mb-1">Steuerungsmodus</div>
@@ -417,86 +745,259 @@ export default function App() {
             {!settingsForm ? (
               <p className="text-slate-400 text-sm">Lade Einstellungen…</p>
             ) : (
-              <div className="flex flex-col gap-6">
+              <div className="flex flex-col gap-4">
 
-                {/* Timezone */}
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-sm font-medium text-slate-300">
-                    Zeitzone
-                  </label>
-                  <select
-                    value={settingsForm.timezone}
-                    onChange={(e) =>
-                      setSettingsForm({ ...settingsForm, timezone: e.target.value })
-                    }
-                    className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
-                  >
-                    <option value="Europe/Berlin">Europe/Berlin (CET/CEST)</option>
-                    <option value="Europe/Vienna">Europe/Vienna (CET/CEST)</option>
-                    <option value="Europe/London">Europe/London (GMT/BST)</option>
-                    <option value="UTC">UTC</option>
-                  </select>
-                </div>
+                {/* Cluster: Allgemein */}
+                <div className="rounded-xl bg-slate-700/30 p-4 flex flex-col gap-4">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                    Allgemein
+                  </h3>
 
-                {/* System capacity */}
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-sm font-medium text-slate-300">
-                    Anlagenleistung (kWp)
-                  </label>
-                  <input
-                    type="number"
-                    min={0.1}
-                    max={1000}
-                    step={0.1}
-                    value={settingsForm.system_capacity_kwp}
-                    onChange={(e) =>
-                      setSettingsForm({
-                        ...settingsForm,
-                        system_capacity_kwp: parseFloat(e.target.value) || 0,
-                      })
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-sm font-medium text-slate-300">Zeitzone</label>
+                    <select
+                      value={settingsForm.timezone}
+                      onChange={(e) =>
+                        setSettingsForm({ ...settingsForm, timezone: e.target.value })
+                      }
+                      className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                    >
+                      <option value="Europe/Berlin">Europe/Berlin (CET/CEST)</option>
+                      <option value="Europe/Vienna">Europe/Vienna (CET/CEST)</option>
+                      <option value="Europe/London">Europe/London (GMT/BST)</option>
+                      <option value="UTC">UTC</option>
+                    </select>
+                  </div>
+
+                  <ToggleSwitch
+                    checked={settingsForm.auto_control_active}
+                    onChange={(v) =>
+                      setSettingsForm({ ...settingsForm, auto_control_active: v })
                     }
-                    className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm w-32 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                    label="Automatische Batteriesteuerung aktiv"
                   />
+
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-medium text-slate-300">
+                        Einspeisebegrenzung
+                      </label>
+                      <span className="text-sm font-semibold text-sky-400">
+                        {settingsForm.export_limit_percent} %
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={settingsForm.export_limit_percent}
+                      onChange={(e) =>
+                        setSettingsForm({
+                          ...settingsForm,
+                          export_limit_percent: parseInt(e.target.value, 10),
+                        })
+                      }
+                      className="w-full accent-sky-500"
+                    />
+                    <div className="flex justify-between text-xs text-slate-500">
+                      <span>0 %</span>
+                      <span>100 %</span>
+                    </div>
+                  </div>
                 </div>
 
-                {/* Export limit */}
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between">
+                {/* Cluster: Standort */}
+                <div className="rounded-xl bg-slate-700/30 p-4 flex flex-col gap-4">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                    Standort
+                  </h3>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-sm font-medium text-slate-300">
+                        Breitengrad
+                      </label>
+                      <input
+                        type="number"
+                        step={0.001}
+                        value={settingsForm.location_lat}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            location_lat: parseFloat(e.target.value) || 0,
+                          })
+                        }
+                        className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-sm font-medium text-slate-300">
+                        Längengrad
+                      </label>
+                      <input
+                        type="number"
+                        step={0.001}
+                        value={settingsForm.location_lon}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            location_lon: parseFloat(e.target.value) || 0,
+                          })
+                        }
+                        className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Cluster: PV-Anlage */}
+                <div className="rounded-xl bg-slate-700/30 p-4 flex flex-col gap-4">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                    PV-Anlage
+                  </h3>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-sm font-medium text-slate-300">
+                        Neigungswinkel (°)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={90}
+                        step={1}
+                        value={settingsForm.panel_tilt}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            panel_tilt: parseInt(e.target.value, 10) || 0,
+                          })
+                        }
+                        className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-sm font-medium text-slate-300">
+                        Azimut (°)
+                      </label>
+                      <input
+                        type="number"
+                        min={-180}
+                        max={180}
+                        step={1}
+                        value={settingsForm.panel_azimuth}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            panel_azimuth: parseInt(e.target.value, 10) || 0,
+                          })
+                        }
+                        className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+                      <p className="text-xs text-slate-500">Süd=0, Ost=−90, West=90</p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-sm font-medium text-slate-300">
+                        Modulleistung (kWp)
+                      </label>
+                      <input
+                        type="number"
+                        min={0.1}
+                        max={1000}
+                        step={0.1}
+                        value={settingsForm.system_capacity_kwp}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            system_capacity_kwp: parseFloat(e.target.value) || 0,
+                          })
+                        }
+                        className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-sm font-medium text-slate-300">
+                        Wechselrichter (kW)
+                      </label>
+                      <input
+                        type="number"
+                        min={0.1}
+                        max={1000}
+                        step={0.1}
+                        value={settingsForm.inverter_max_kw}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            inverter_max_kw: parseFloat(e.target.value) || 0,
+                          })
+                        }
+                        className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-medium text-slate-300">
+                        Systemwirkungsgrad
+                      </label>
+                      <span className="text-sm font-semibold text-sky-400">
+                        {(settingsForm.system_efficiency * 100).toFixed(0)} %
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={1.0}
+                      step={0.01}
+                      value={settingsForm.system_efficiency}
+                      onChange={(e) =>
+                        setSettingsForm({
+                          ...settingsForm,
+                          system_efficiency: parseFloat(e.target.value),
+                        })
+                      }
+                      className="w-full accent-sky-500"
+                    />
+                    <div className="flex justify-between text-xs text-slate-500">
+                      <span>50 %</span>
+                      <span>100 %</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Cluster: Batteriespeicher */}
+                <div className="bg-slate-700/30 rounded-xl p-4 space-y-4">
+                  <h3 className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+                    Batteriespeicher
+                  </h3>
+                  <div className="flex flex-col gap-1.5">
                     <label className="text-sm font-medium text-slate-300">
-                      Einspeisebegrenzung
+                      Kapazität Batteriespeicher (kWh)
                     </label>
-                    <span className="text-sm font-semibold text-sky-400">
-                      {settingsForm.export_limit_percent} %
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    step={1}
-                    value={settingsForm.export_limit_percent}
-                    onChange={(e) =>
-                      setSettingsForm({
-                        ...settingsForm,
-                        export_limit_percent: parseInt(e.target.value, 10),
-                      })
-                    }
-                    className="w-full accent-sky-500"
-                  />
-                  <div className="flex justify-between text-xs text-slate-500">
-                    <span>0 %</span>
-                    <span>100 %</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={1000}
+                      step={0.1}
+                      value={settingsForm.battery_capacity_kwh}
+                      onChange={(e) =>
+                        setSettingsForm({
+                          ...settingsForm,
+                          battery_capacity_kwh: parseFloat(e.target.value) || 0,
+                        })
+                      }
+                      className="rounded-lg bg-slate-700 border border-slate-600 text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                    />
+                    <p className="text-xs text-slate-500">
+                      Nutzbare Kapazität des installierten Batteriespeichers.
+                    </p>
                   </div>
                 </div>
-
-                {/* Auto control */}
-                <ToggleSwitch
-                  checked={settingsForm.auto_control_active}
-                  onChange={(v) =>
-                    setSettingsForm({ ...settingsForm, auto_control_active: v })
-                  }
-                  label="Automatische Batteriesteuerung aktiv"
-                />
 
                 {/* Feedback */}
                 {settingsError && (
