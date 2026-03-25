@@ -191,21 +191,23 @@ function calculateExportExcessEnergyKWh(data: ChartPoint[], limitWatts: number):
 }
 
 function mergeChartData(history: PowerLog[], forecast: ForecastPoint[], range: TimeRange): ChartPoint[] {
-  // Open-Meteo liefert "2024-03-22T10:00" (UTC) → key = "2024-03-22T10:00Z"
-  const forecastByHour = new Map<string, number>();
+  // Open-Meteo liefert "2026-03-25T10:15" (UTC, 15-min) → key = "2026-03-25T10:15Z"
+  const forecastByTime = new Map<string, number>();
   for (const f of forecast) {
-    forecastByHour.set(f.time + "Z", f.expected_kw);
+    forecastByTime.set(f.time + "Z", f.expected_kw);
   }
 
   const rangeStart = new Date(range.start);
   const rangeEnd = new Date(range.end);
   const points: ChartPoint[] = [];
 
-  // History points with matched forecast value per hour
+  // History points with matched forecast value per 15-min interval
   for (const h of history) {
-    // PocketBase UTC: "2024-03-22T10:05:00.000Z" → match key "2024-03-22T10:00Z"
-    const hourKey = h.created.slice(0, 13) + ":00Z";
-    const fVal = forecastByHour.get(hourKey) ?? null;
+    // PocketBase UTC: "2026-03-25T10:07:00.000Z" → round down to "2026-03-25T10:00Z"
+    const d = new Date(h.created);
+    d.setMinutes(d.getMinutes() - (d.getMinutes() % 15), 0, 0);
+    const quarterKey = d.toISOString().slice(0, 16) + "Z";
+    const fVal = forecastByTime.get(quarterKey) ?? null;
     points.push({
       time: h.created,
       pv_power: h.pv_power,
@@ -217,28 +219,76 @@ function mergeChartData(history: PowerLog[], forecast: ForecastPoint[], range: T
     });
   }
 
-  // Forecast-only points — expanded to minute resolution for uniform x-axis scaling
+  // Forecast-only points interpolated to 1-min resolution
   const latestHistory = history.length > 0 ? new Date(history[history.length - 1].created) : rangeStart;
 
-  if (forecastByHour.size > 0) {
-    const startMinute = new Date(latestHistory);
-    startMinute.setSeconds(0, 0);
-    startMinute.setMinutes(startMinute.getMinutes() + 1);
+  if (forecastByTime.size > 0) {
+    // Collect future forecast anchor points (15-min intervals)
+    // Include one extra anchor beyond rangeEnd so interpolation covers the full range
+    const futureForecast: { time: number; value: number }[] = [];
+    const latestMs = latestHistory.getTime();
+    const collectEnd = rangeEnd.getTime() + 900_000;
+    for (const [key, val] of forecastByTime) {
+      const t = new Date(key).getTime();
+      if (t >= latestMs && t <= collectEnd) {
+        futureForecast.push({ time: t, value: val * 1000 });
+      }
+    }
+    futureForecast.sort((a, b) => a.time - b.time);
 
-    for (let t = new Date(startMinute); t <= rangeEnd; t = new Date(t.getTime() + 60_000)) {
-      const hourKey = t.toISOString().slice(0, 13) + ":00Z";
-      const fVal = forecastByHour.get(hourKey) ?? null;
-      if (fVal !== null) {
+    if (futureForecast.length >= 2) {
+      // Walk in 1-min steps, linearly interpolating between 15-min anchors
+      const start1 = new Date(latestHistory);
+      start1.setSeconds(0, 0);
+      start1.setMinutes(start1.getMinutes() + 1);
+
+      let idx = 0;
+      for (let t = start1.getTime(); t <= rangeEnd.getTime(); t += 60_000) {
+        while (idx < futureForecast.length - 1 && futureForecast[idx + 1].time <= t) {
+          idx++;
+        }
+        if (t < futureForecast[0].time || t > futureForecast[futureForecast.length - 1].time) continue;
+
+        // Guard: idx on last anchor → emit its value directly (no idx+1 available)
+        if (idx >= futureForecast.length - 1) {
+          points.push({
+            time: new Date(t).toISOString(),
+            pv_power: null,
+            load_power: null,
+            grid_power: null,
+            battery_power: null,
+            battery_soc: null,
+            expected_kw: futureForecast[idx].value,
+          });
+          continue;
+        }
+
+        const prev = futureForecast[idx];
+        const next = futureForecast[idx + 1];
+        const interpValue = prev.time === next.time
+          ? prev.value
+          : prev.value + (next.value - prev.value) * (t - prev.time) / (next.time - prev.time);
+
         points.push({
-          time: t.toISOString(),
+          time: new Date(t).toISOString(),
           pv_power: null,
           load_power: null,
           grid_power: null,
           battery_power: null,
           battery_soc: null,
-          expected_kw: fVal * 1000,
+          expected_kw: interpValue,
         });
       }
+    } else if (futureForecast.length === 1) {
+      points.push({
+        time: new Date(futureForecast[0].time).toISOString(),
+        pv_power: null,
+        load_power: null,
+        grid_power: null,
+        battery_power: null,
+        battery_soc: null,
+        expected_kw: futureForecast[0].value,
+      });
     }
   }
 
