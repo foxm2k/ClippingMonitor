@@ -14,7 +14,7 @@ import {
 import { Sun, Home, Zap, Battery, Settings, Bot } from "lucide-react";
 import api from "./api";
 import type { AppSettings, ForecastPoint, PowerLog, TimeRange } from "./api";
-import { fetchSettings, updateSettings, fetchHistory, fetchForecast, getTimeRange, setChargeLimit } from "./api";
+import { fetchSettings, updateSettings, fetchHistory, fetchLatest, fetchForecast, getTimeRange, setChargeLimit } from "./api";
 
 interface BatteryStatus {
   success: boolean;
@@ -448,8 +448,12 @@ export default function App() {
   const formatTime = makeTimeFormatter(settings?.timezone ?? "Europe/Berlin");
 
   const fetchLive = async () => {
-    const data = await fetchHistory();
-    if (data.length > 0) setLive(data[data.length - 1]);
+    try {
+      const latest = await fetchLatest();
+      if (latest) setLive(latest);
+    } catch (err) {
+      console.error("fetchLive fehlgeschlagen:", err);
+    }
   };
 
   const loadChartData = async (filter: FilterMode, forecastData: ForecastPoint[]) => {
@@ -503,8 +507,10 @@ export default function App() {
 
     init();
     const interval = setInterval(() => {
-      fetchLive();
-      loadChartData(activeFilterRef.current, forecastRef.current);
+      fetchLive().catch((err) => console.error("Periodic fetchLive failed:", err));
+      loadChartData(activeFilterRef.current, forecastRef.current).catch((err) =>
+        console.error("Periodic loadChartData failed:", err)
+      );
     }, 60_000);
     return () => clearInterval(interval);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -779,8 +785,21 @@ export default function App() {
                     }
                     return [formatPowerString(Number(value)), String(name)];
                   }}
+                  itemSorter={(item) => {
+                    const order = ["pv_power", "expected_kw", "load_power", "battery_power", "grid_power"];
+                    const idx = order.indexOf(item.dataKey as string);
+                    return idx >= 0 ? idx : 999;
+                  }}
                 />
-                <Legend onClick={handleLegendClick} wrapperStyle={{ cursor: "pointer" }} />
+                <Legend
+                  onClick={handleLegendClick}
+                  wrapperStyle={{ cursor: "pointer" }}
+                  itemSorter={(item) => {
+                    const order = ["pv_power", "expected_kw", "load_power", "battery_power", "grid_power"];
+                    const idx = order.indexOf(item.dataKey as string);
+                    return idx >= 0 ? idx : 999;
+                  }}
+                />
                 <Line
                   type="monotone"
                   dataKey="pv_power"
@@ -789,6 +808,17 @@ export default function App() {
                   dot={false}
                   strokeWidth={2}
                   hide={hiddenLines.has("pv_power")}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="expected_kw"
+                  name="Vorhersage PV"
+                  stroke="#fbbf24"
+                  strokeDasharray="5 5"
+                  strokeWidth={2}
+                  dot={false}
+                  connectNulls
+                  hide={hiddenLines.has("expected_kw")}
                 />
                 <Line
                   type="monotone"
@@ -801,15 +831,6 @@ export default function App() {
                 />
                 <Line
                   type="monotone"
-                  dataKey="grid_power"
-                  name="Netz"
-                  stroke="#a78bfa"
-                  dot={false}
-                  strokeWidth={2}
-                  hide={hiddenLines.has("grid_power")}
-                />
-                <Line
-                  type="monotone"
                   dataKey="battery_power"
                   name="Batterie"
                   stroke="#4ade80"
@@ -819,14 +840,12 @@ export default function App() {
                 />
                 <Line
                   type="monotone"
-                  dataKey="expected_kw"
-                  name="Vorhersage PV"
-                  stroke="#fbbf24"
-                  strokeDasharray="5 5"
-                  strokeWidth={2}
+                  dataKey="grid_power"
+                  name="Netz"
+                  stroke="#a78bfa"
                   dot={false}
-                  connectNulls
-                  hide={hiddenLines.has("expected_kw")}
+                  strokeWidth={2}
+                  hide={hiddenLines.has("grid_power")}
                 />
               </ComposedChart>
             </ResponsiveContainer>
@@ -945,6 +964,38 @@ export default function App() {
                       <span>0 %</span>
                       <span>100 %</span>
                     </div>
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-medium text-slate-300">
+                        Forecast-Sicherheitsfaktor
+                      </label>
+                      <span className="text-sm font-semibold text-sky-400">
+                        {(settingsForm.safety_factor * 100).toFixed(0)} %
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={1.0}
+                      step={0.01}
+                      value={settingsForm.safety_factor}
+                      onChange={(e) =>
+                        setSettingsForm({
+                          ...settingsForm,
+                          safety_factor: parseFloat(e.target.value),
+                        })
+                      }
+                      className="w-full accent-sky-500"
+                    />
+                    <div className="flex justify-between text-xs text-slate-500">
+                      <span>50 % (konservativ)</span>
+                      <span>100 % (optimistisch)</span>
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      Abschlag auf den PV-Forecast für die KI-Batteriesteuerung. Niedrigere Werte = früherer Ladebeginn als Sicherheitspuffer.
+                    </p>
                   </div>
                 </div>
 
