@@ -313,7 +313,7 @@ async def _fetch_forecast(s: AppSettings) -> list[dict]:
     params = {
         "latitude": s.location_lat,
         "longitude": s.location_lon,
-        "hourly": "global_tilted_irradiance",
+        "minutely_15": "global_tilted_irradiance",
         "tilt": s.panel_tilt,
         "azimuth": s.panel_azimuth,
         "past_days": 1,
@@ -325,8 +325,8 @@ async def _fetch_forecast(s: AppSettings) -> list[dict]:
         response.raise_for_status()
         data = response.json()
 
-    times = data["hourly"]["time"]
-    irradiances = data["hourly"]["global_tilted_irradiance"]
+    times = data["minutely_15"]["time"]
+    irradiances = data["minutely_15"]["global_tilted_irradiance"]
 
     result = []
     for time_str, irr in zip(times, irradiances):
