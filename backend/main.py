@@ -79,8 +79,8 @@ def parse_fronius_data(data: dict) -> dict:
             "battery_power": p_akku,
             "battery_soc": soc,
         }
-    except Exception as e:
-        print(f"Fehler beim Parsen der Fronius Daten: {e}")
+    except Exception:
+        logger.error(f"Fehler beim Parsen der Fronius Daten:")
         return {
             "pv_power": 0.0,
             "load_power": 0.0,
