@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from pocketbase import PocketBase
 from pydantic import BaseModel
 
+from auto_control import AutoController
 from modbus_service import FroniusModbusClient
 
 
@@ -52,6 +53,7 @@ class AppSettings(BaseModel):
     inverter_max_kw: float = 15.0
     battery_capacity_kwh: float = 0.0
     system_efficiency: float = 0.85
+    safety_factor: float = 0.80
 
 
 def parse_fronius_data(data: dict) -> dict:
@@ -88,6 +90,16 @@ def parse_fronius_data(data: dict) -> dict:
         }
 
 
+auto_controller: AutoController | None = None
+
+_forecast_cache: list[dict] = []
+_forecast_cache_time: datetime.datetime | None = None
+_forecast_cache_settings_key: tuple | None = None
+FORECAST_CACHE_TTL = 900  # 15 Minuten in Sekunden
+
+_battery_status_cache: dict | None = None
+
+
 async def poll_and_store_data():
     """Fragt zyklisch den Wechselrichter ab und speichert die Daten in PocketBase."""
     logger.info("Background-Poller gestartet (Intervall: %ds)", POLL_INTERVAL)
@@ -110,6 +122,61 @@ async def poll_and_store_data():
             )
             logger.info("Gespeichert in PocketBase (ID: %s)", record.id)
 
+            # Auto-Control prüfen
+            try:
+                settings_response = await get_settings()
+                if (
+                    isinstance(settings_response, AppSettings)
+                    and settings_response.auto_control_active
+                    and auto_controller is not None
+                ):
+                    forecast_data = await _get_cached_forecast(settings_response)
+
+                    battery_status = await _get_cached_battery_status()
+                    wchamax = (
+                        battery_status.get("wchamax_watt", 15000)
+                        if battery_status
+                        else 15000
+                    )
+
+                    export_limit_w = (
+                        settings_response.system_capacity_kwp
+                        * 1000
+                        * settings_response.export_limit_percent
+                        / 100
+                    )
+
+                    ac_result = auto_controller.run_cycle(
+                        soc=parsed["battery_soc"],
+                        grid_power=parsed["grid_power"],
+                        forecast=forecast_data,
+                        battery_cap_kwh=settings_response.battery_capacity_kwh,
+                        wchamax_watt=wchamax,
+                        export_limit_w=export_limit_w,
+                        safety_factor=settings_response.safety_factor,
+                    )
+
+                    logger.info("AutoControl: %s", ac_result.reason)
+
+                    if ac_result.should_write:
+                        modbus_client = FroniusModbusClient()
+                        write_result = await modbus_client.set_charge_limit(
+                            ac_result.inwrte_pct
+                        )
+                        if write_result.get("success"):
+                            auto_controller.update_current_inwrte(ac_result.inwrte_pct)
+                            logger.info(
+                                "AutoControl: InWRte auf %.1f%% gesetzt",
+                                ac_result.inwrte_pct,
+                            )
+                        else:
+                            logger.error(
+                                "AutoControl: Modbus-Write fehlgeschlagen: %s",
+                                write_result,
+                            )
+            except Exception:
+                logger.exception("Fehler im Auto-Control-Zyklus")
+
         except httpx.ConnectError:
             logger.warning("Wechselrichter nicht erreichbar – überspringe Zyklus")
         except httpx.TimeoutException:
@@ -120,8 +187,56 @@ async def poll_and_store_data():
         await asyncio.sleep(POLL_INTERVAL)
 
 
+def _forecast_settings_key(s: AppSettings) -> tuple:
+    """Gibt einen hashbaren Schlüssel der forecast-relevanten Settings zurück."""
+    return (
+        s.location_lat,
+        s.location_lon,
+        s.panel_tilt,
+        s.panel_azimuth,
+        s.system_capacity_kwp,
+        s.inverter_max_kw,
+        s.system_efficiency,
+    )
+
+
+async def _get_cached_forecast(settings: AppSettings) -> list[dict]:
+    global _forecast_cache, _forecast_cache_time, _forecast_cache_settings_key
+    now = datetime.datetime.now(datetime.timezone.utc)
+    current_key = _forecast_settings_key(settings)
+    if (
+        _forecast_cache_time is None
+        or (now - _forecast_cache_time).total_seconds() > FORECAST_CACHE_TTL
+        or current_key != _forecast_cache_settings_key
+    ):
+        _forecast_cache = await _fetch_forecast(settings)
+        _forecast_cache_time = now
+        _forecast_cache_settings_key = current_key
+        logger.info("Forecast-Cache aktualisiert (%d Slots, Settings-Key: %s)", len(_forecast_cache), current_key)
+    return _forecast_cache
+
+
+async def _get_cached_battery_status() -> dict | None:
+    global _battery_status_cache
+    if _battery_status_cache is None:
+        try:
+            modbus = FroniusModbusClient()
+            result = await modbus.get_battery_status()
+            if result.get("success"):
+                _battery_status_cache = result
+                logger.info("Battery-Status-Cache initialisiert: wchamax=%d W", result.get("wchamax_watt", 0))
+            else:
+                logger.warning("Battery-Status konnte nicht gelesen werden: %s", result)
+        except Exception:
+            logger.exception("Fehler beim Lesen des Battery-Status für Cache")
+    return _battery_status_cache
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global auto_controller
+    auto_controller = AutoController()
+
     # Modbus-Verbindungstest beim Start
     modbus = FroniusModbusClient()
     result = await modbus.test_connection()
@@ -129,6 +244,9 @@ async def lifespan(app: FastAPI):
         logger.info("Modbus-Test erfolgreich: %s", result)
     else:
         logger.warning("Modbus-Test fehlgeschlagen: %s", result)
+
+    # Battery-Status initial cachen
+    await _get_cached_battery_status()
 
     task = asyncio.create_task(poll_and_store_data())
     yield
@@ -262,6 +380,31 @@ async def set_charge_limit(request: ChargeLimitRequest):
         )
 
 
+@app.get("/api/latest")
+async def get_latest():
+    try:
+        pb = PocketBase(POCKETBASE_URL)
+        result = await asyncio.to_thread(
+            pb.collection("power_logs").get_list,
+            1, 1, {"sort": "-created"},
+        )
+        if result.items:
+            r = result.items[0]
+            return {
+                "id": r.id,
+                "created": _format_created(r.created),
+                "pv_power": r.pv_power,
+                "load_power": r.load_power,
+                "grid_power": r.grid_power,
+                "battery_power": r.battery_power,
+                "battery_soc": r.battery_soc,
+            }
+        return None
+    except Exception:
+        logger.exception("Fehler beim Abrufen des letzten Datenpunkts")
+        return JSONResponse(status_code=500, content={"error": "Letzter Datenpunkt nicht verfügbar"})
+
+
 @app.get("/api/settings")
 async def get_settings():
     try:
@@ -276,7 +419,9 @@ async def get_settings():
                 "panel_azimuth": 0,
                 "system_capacity_kwp": 0.0,
                 "inverter_max_kw": 15.0,
+                "battery_capacity_kwh": 0.0,
                 "system_efficiency": 0.85,
+                "safety_factor": 0.80,
             }
             SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_FILE.write_text(json.dumps(initial, indent=4), encoding="utf-8")
@@ -362,3 +507,18 @@ async def get_forecast():
             status_code=500,
             content={"error": "Vorhersage konnte nicht geladen werden"},
         )
+
+
+@app.get("/api/auto_control/status")
+async def get_auto_control_status():
+    if auto_controller is None:
+        return {"active": False}
+    settings_response = await get_settings()
+    active = (
+        isinstance(settings_response, AppSettings)
+        and settings_response.auto_control_active
+    )
+    return {
+        "active": active,
+        "current_inwrte": auto_controller._current_inwrte,
+    }

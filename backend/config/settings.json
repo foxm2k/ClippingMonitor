@@ -1,7 +1,7 @@
 {
     "timezone": "Europe/Berlin",
     "export_limit_percent": 60,
-    "auto_control_active": false,
+    "auto_control_active": true,
     "location_lat": 48.6226,
     "location_lon": 12.481792,
     "panel_tilt": 35,
@@ -9,5 +9,6 @@
     "system_capacity_kwp": 15.36,
     "inverter_max_kw": 15.0,
     "battery_capacity_kwh": 15.795,
-    "system_efficiency": 0.99
+    "system_efficiency": 0.99,
+    "safety_factor": 0.8
 }

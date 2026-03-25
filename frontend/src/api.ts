@@ -16,6 +16,7 @@ export interface AppSettings {
   inverter_max_kw: number;
   battery_capacity_kwh: number;
   system_efficiency: number;
+  safety_factor: number;
 }
 
 export interface PowerLog {
@@ -69,6 +70,11 @@ export function getTimeRange(filter: "24h" | "today" | "yesterday" | "tomorrow")
 export async function fetchHistory(range?: TimeRange): Promise<PowerLog[]> {
   const params = range ? `?start=${encodeURIComponent(range.start)}&end=${encodeURIComponent(range.end)}` : "";
   const response = await api.get<PowerLog[]>(`/api/history${params}`);
+  return response.data;
+}
+
+export async function fetchLatest(): Promise<PowerLog | null> {
+  const response = await api.get<PowerLog | null>("/api/latest");
   return response.data;
 }
 
