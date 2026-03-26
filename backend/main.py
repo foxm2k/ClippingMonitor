@@ -1,3 +1,4 @@
+import os
 import asyncio
 import datetime
 import json
@@ -30,8 +31,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-FRONIUS_URL = "http://192.168.123.79/solar_api/v1/GetPowerFlowRealtimeData.fcgi"
-POCKETBASE_URL = "http://127.0.0.1:8090"
+FRONIUS_URL = os.getenv("FRONIUS_URL", "http://192.168.123.79/solar_api/v1/GetPowerFlowRealtimeData.fcgi")
+POCKETBASE_URL = os.getenv("POCKETBASE_URL", "http://127.0.0.1:8090")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 POLL_INTERVAL = 60  # Sekunden
 SETTINGS_FILE = Path(__file__).parent / "config" / "settings.json"
