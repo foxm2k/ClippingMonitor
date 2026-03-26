@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -29,15 +30,65 @@ class AutoControlResult:
     plan_summary: str
 
 
+@dataclass
+class AutoControlLogEntry:
+    timestamp: str          # UTC ISO-8601
+    soc: float              # SOC zum Zeitpunkt der Entscheidung
+    grid_power: float       # Grid-Power zum Zeitpunkt
+    inwrte_pct: float       # Berechneter Zielwert
+    should_write: bool      # Ob Modbus geschrieben wurde
+    reason: str             # Entscheidungsbegründung
+    energy_needed_kwh: float
+    total_clipping_kwh: float
+    plan_summary: str
+
+
 class AutoController:
     """Intelligente Batterie-Ladesteuerung basierend auf PV-Forecast."""
 
     def __init__(self):
         self._current_inwrte: float = 100.0  # Letzter geschriebener Wert
+        self._log: deque[AutoControlLogEntry] = deque(maxlen=200)
 
     def update_current_inwrte(self, pct: float):
         """Wird nach erfolgreichem Modbus-Write aufgerufen."""
         self._current_inwrte = pct
+
+    def get_log(self, limit: int = 120) -> list[dict]:
+        """Gibt die letzten `limit` Einträge zurück, neueste zuerst."""
+        entries = list(self._log)[-limit:]
+        entries.reverse()
+        return [
+            {
+                "timestamp": e.timestamp,
+                "soc": e.soc,
+                "grid_power": e.grid_power,
+                "inwrte_pct": e.inwrte_pct,
+                "should_write": e.should_write,
+                "reason": e.reason,
+                "energy_needed_kwh": e.energy_needed_kwh,
+                "total_clipping_kwh": e.total_clipping_kwh,
+                "plan_summary": e.plan_summary,
+            }
+            for e in entries
+        ]
+
+    def _log_result(
+        self, result: AutoControlResult, soc: float, grid_power: float
+    ) -> AutoControlResult:
+        """Protokolliert ein AutoControlResult im Ringbuffer und gibt es zurück."""
+        self._log.append(AutoControlLogEntry(
+            timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            soc=soc,
+            grid_power=grid_power,
+            inwrte_pct=result.inwrte_pct,
+            should_write=result.should_write,
+            reason=result.reason,
+            energy_needed_kwh=round(result.energy_needed_kwh, 2),
+            total_clipping_kwh=round(result.total_clipping_kwh, 2),
+            plan_summary=result.plan_summary,
+        ))
+        return result
 
     def run_cycle(
         self,
@@ -51,14 +102,14 @@ class AutoController:
     ) -> AutoControlResult:
         # Edge Case: Kein Batterie-Kapazität konfiguriert
         if battery_cap_kwh <= 0:
-            return AutoControlResult(
+            return self._log_result(AutoControlResult(
                 inwrte_pct=100.0,
                 should_write=abs(100.0 - self._current_inwrte) >= HYSTERESIS_PCT,
-                reason="Keine Batteriekapazität konfiguriert → InWRte=100%",
+                reason="Keine Batteriekapazität konfiguriert — Ladung ohne Einschränkung.",
                 energy_needed_kwh=0.0,
                 total_clipping_kwh=0.0,
-                plan_summary="Keine Steuerung (battery_cap_kwh=0)",
-            )
+                plan_summary="Keine Steuerung möglich (Kapazität nicht konfiguriert)",
+            ), soc, grid_power)
 
         # Schritt 1 — Energiebedarf
         energy_needed_kwh = battery_cap_kwh * (1 - soc / 100)
@@ -71,14 +122,14 @@ class AutoController:
         if energy_needed_kwh <= 0:
             target_pct = 0.0
             should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
-            return AutoControlResult(
+            return self._log_result(AutoControlResult(
                 inwrte_pct=target_pct,
                 should_write=should_write,
-                reason="SOC=100% → InWRte=0%",
+                reason="Batterie ist voll (SOC 100%) — Ladung gestoppt.",
                 energy_needed_kwh=0.0,
                 total_clipping_kwh=0.0,
-                plan_summary="Batterie voll, Ladung gestoppt",
-            )
+                plan_summary="Batterie voll — keine Ladung nötig",
+            ), soc, grid_power)
 
         # Kein Einspeiselimit konfiguriert → kein Clipping möglich
         if export_limit_w <= 0:
@@ -122,14 +173,14 @@ class AutoController:
         if not future_slots:
             target_pct = 100.0
             should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
-            return AutoControlResult(
+            return self._log_result(AutoControlResult(
                 inwrte_pct=target_pct,
                 should_write=should_write,
-                reason="Kein Forecast → InWRte=100%",
+                reason="Kein Forecast verfügbar — Batterie lädt ohne Einschränkung.",
                 energy_needed_kwh=energy_needed_kwh,
                 total_clipping_kwh=0.0,
-                plan_summary="Kein Forecast verfügbar, volle Ladung",
-            )
+                plan_summary="Kein Forecast — volle Ladung als Fallback",
+            ), soc, grid_power)
 
         # Schritt 3 — Rückwärts-Allokation: Clipping-Energie zuerst
         remaining = energy_needed_kwh
@@ -197,38 +248,70 @@ class AutoController:
         # Schritt 7 — Hysterese
         should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
 
-        # Reason-String zusammenbauen
-        reason_parts = [f"Plan: {plan_pct:.1f}%"]
-        if boost_pct > 0:
-            reason_parts.append(f"Boost: +{boost_pct:.1f}%")
-        reason_parts.append(f"Final: {target_pct:.1f}%")
-        if not should_write:
-            reason_parts.append(f"(keine Änderung, Δ={abs(target_pct - self._current_inwrte):.1f}% < {HYSTERESIS_PCT}%)")
-        reason = ", ".join(reason_parts)
-
-        # Plan-Summary
+        # Reason-String zusammenbauen (menschenlesbar)
         total_planned = sum(s.charge_kwh for s in future_slots)
+
+        if not should_write:
+            delta = abs(target_pct - self._current_inwrte)
+            reason = (
+                f"Berechneter Wert ({target_pct:.1f}%) weicht weniger als "
+                f"{HYSTERESIS_PCT:.0f}% vom aktuellen ({self._current_inwrte:.1f}%) ab "
+                f"(Δ {delta:.1f}%). Modbus-Schreibbefehl übersprungen."
+            )
+        elif boost_pct > 0 and plan_pct <= 0:
+            reason = (
+                f"Laut Plan wäre hier keine Ladung nötig (0%) — "
+                f"spätere Zeitfenster reichen aus. "
+                f"ABER: Einspeisung liegt gerade ~{actual_export - export_limit_w:.0f} W "
+                f"über dem Limit → Sofort-Korrektur um +{boost_pct:.1f}%, "
+                f"damit der Überschuss in die Batterie fließt statt ins Netz."
+            )
+        elif boost_pct > 0:
+            reason = (
+                f"Laut Plan soll die Batterie mit {plan_pct:.1f}% laden. "
+                f"Zusätzlich liegt die Einspeisung ~{actual_export - export_limit_w:.0f} W "
+                f"über dem Limit → Boost um +{boost_pct:.1f}% auf insgesamt {target_pct:.1f}%."
+            )
+        elif not_enough_sun:
+            reason = (
+                f"Nicht genug Sonne für die volle Ladung! "
+                f"Nur {total_planned:.1f} kWh verfügbar, "
+                f"aber {energy_needed_kwh:.1f} kWh benötigt. "
+                f"Batterie lädt mit maximaler Leistung."
+            )
+        else:
+            reason = (
+                f"Laut Plan soll die Batterie in diesem Zeitfenster "
+                f"mit {plan_pct:.1f}% der max. Ladeleistung laden. "
+                f"Genug Clipping-Energie vorhanden "
+                f"({total_clipping_kwh:.1f} kWh verfügbar, "
+                f"{energy_needed_kwh:.1f} kWh benötigt)."
+            )
+
+        # Plan-Summary (Kurzfassung)
         if not_enough_sun:
             plan_summary = (
-                f"Nicht genug Sonne! Bedarf={energy_needed_kwh:.1f}kWh, "
-                f"verfügbar={total_planned:.1f}kWh (Clipping={total_clipping_kwh:.1f}kWh)"
+                f"Nicht genug Sonne! Bedarf: {energy_needed_kwh:.1f} kWh, "
+                f"verfügbar: {total_planned:.1f} kWh "
+                f"(Clipping: {total_clipping_kwh:.1f} kWh)"
             )
         else:
             plan_summary = (
-                f"Bedarf={energy_needed_kwh:.1f}kWh, "
-                f"geplant={total_planned:.1f}kWh (Clipping={total_clipping_kwh:.1f}kWh)"
+                f"Bedarf: {energy_needed_kwh:.1f} kWh, "
+                f"geplant: {total_planned:.1f} kWh "
+                f"(Clipping: {total_clipping_kwh:.1f} kWh)"
             )
 
         logger.info("AutoControl: %s | %s | %s", reason, plan_detail, plan_summary)
 
-        return AutoControlResult(
+        return self._log_result(AutoControlResult(
             inwrte_pct=round(target_pct, 1),
             should_write=should_write,
             reason=reason,
             energy_needed_kwh=energy_needed_kwh,
             total_clipping_kwh=total_clipping_kwh,
             plan_summary=plan_summary,
-        )
+        ), soc, grid_power)
 
     @staticmethod
     def _find_current_slot(
