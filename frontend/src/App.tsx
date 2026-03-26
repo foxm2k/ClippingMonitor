@@ -11,7 +11,7 @@ import {
   ReferenceLine,
   ReferenceArea,
 } from "recharts";
-import { Sun, Home, Zap, Battery, Settings, Bot } from "lucide-react";
+import { Sun, Home, Zap, Battery, Settings, Bot, RefreshCw, ChevronDown, ChevronUp } from "lucide-react";
 import api from "./api";
 import type { AppSettings, ForecastPoint, PowerLog, TimeRange } from "./api";
 import { fetchSettings, updateSettings, fetchHistory, fetchLatest, fetchForecast, getTimeRange, setChargeLimit } from "./api";
@@ -413,6 +413,169 @@ function ChargeLimitCard({
             )}
           </button>
         </div>
+      )}
+    </div>
+  );
+}
+
+interface AutoControlLogEntry {
+  timestamp: string;
+  soc: number;
+  grid_power: number;
+  inwrte_pct: number;
+  should_write: boolean;
+  reason: string;
+  energy_needed_kwh: number;
+  total_clipping_kwh: number;
+  plan_summary: string;
+}
+
+function AutoControlLog({
+  settings,
+  battery,
+}: {
+  settings: AppSettings;
+  battery: BatteryStatus;
+}) {
+  const [open, setOpen] = useState(false);
+  const [entries, setEntries] = useState<AutoControlLogEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [limit, setLimit] = useState(120);
+  const hasFetched = useRef(false);
+
+  const fetchLog = async (n: number) => {
+    setLoading(true);
+    try {
+      const res = await api.get<AutoControlLogEntry[]>(`/api/auto_control/log?limit=${n}`);
+      setEntries(res.data);
+    } catch (err) {
+      console.error("Failed to fetch auto control log:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleToggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !hasFetched.current) {
+      hasFetched.current = true;
+      fetchLog(limit);
+    }
+  };
+
+  const handleLimitChange = (n: number) => {
+    setLimit(n);
+    fetchLog(n);
+  };
+
+  const formatTimestamp = (iso: string) =>
+    new Date(iso).toLocaleTimeString("de-AT", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZone: settings.timezone,
+    });
+
+  return (
+    <div className="rounded-2xl bg-slate-800 p-6 mt-6">
+      {/* Header */}
+      <button
+        type="button"
+        onClick={handleToggle}
+        className="w-full flex items-center justify-between text-left"
+      >
+        <div className="flex items-center gap-2">
+          <Bot size={20} className="text-sky-400" />
+          <h2 className="text-lg font-semibold text-white">
+            KI-Entscheidungsprotokoll
+          </h2>
+        </div>
+        <div className="flex items-center gap-2 text-sm text-slate-400">
+          {entries.length > 0 && <span>{entries.length} Einträge</span>}
+          {open ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+        </div>
+      </button>
+
+      {open && (
+        <>
+          {/* Toolbar */}
+          <div className="flex items-center gap-3 mt-4 mb-3">
+            <button
+              type="button"
+              onClick={() => fetchLog(limit)}
+              disabled={loading}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-full bg-slate-700 text-slate-300 hover:bg-slate-600 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+              Aktualisieren
+            </button>
+            <select
+              value={limit}
+              onChange={(e) => handleLimitChange(Number(e.target.value))}
+              className="rounded-lg bg-slate-700 border border-slate-600 text-white px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-sky-500"
+            >
+              <option value={30}>30 Einträge</option>
+              <option value={60}>60 Einträge</option>
+              <option value={120}>120 Einträge</option>
+            </select>
+          </div>
+
+          {/* Log list */}
+          <div className="max-h-96 overflow-y-auto space-y-2">
+            {loading && entries.length === 0 && (
+              <p className="text-sm text-slate-400 py-4 text-center">Lade Protokoll…</p>
+            )}
+            {!loading && entries.length === 0 && (
+              <p className="text-sm text-slate-400 py-4 text-center">Noch keine Einträge vorhanden.</p>
+            )}
+            {entries.map((e, i) => {
+              const isNotEnoughSun = e.plan_summary.includes("Nicht genug Sonne");
+              const chargeWatt = (e.inwrte_pct / 100) * battery.wchamax_watt;
+              return (
+                <div
+                  key={i}
+                  className={`rounded-lg bg-slate-700/30 p-3 border-l-2 ${
+                    e.should_write ? "border-l-emerald-400" : "border-l-slate-600"
+                  }`}
+                >
+                  {/* Kopfzeile: Zeit, SOC, Energiebedarf */}
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400 mb-2">
+                    <span className="font-mono">{formatTimestamp(e.timestamp)}</span>
+                    <span className="text-slate-600">|</span>
+                    <span>Batterie: {e.soc.toFixed(0)}%</span>
+                    <span className="text-slate-600">|</span>
+                    <span>Noch {e.energy_needed_kwh.toFixed(1)} kWh bis voll</span>
+                  </div>
+
+                  {/* Aktion */}
+                  <div className="text-sm mb-2">
+                    {e.should_write ? (
+                      <span className="text-emerald-400">
+                        ✍️ Ladelimit auf {e.inwrte_pct.toFixed(1)}% gesetzt
+                        ({"\u2248"} {formatPowerString(chargeWatt)})
+                      </span>
+                    ) : (
+                      <span className="text-slate-400">
+                        ⏸️ Keine Änderung — Ladelimit bleibt bei {e.inwrte_pct.toFixed(1)}%
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Grund */}
+                  <div
+                    className={`text-xs leading-relaxed ${
+                      isNotEnoughSun ? "text-amber-400" : "text-slate-400"
+                    }`}
+                  >
+                    <span className="text-slate-500 font-medium">Grund: </span>
+                    {e.reason}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
       )}
     </div>
   );
@@ -898,6 +1061,11 @@ export default function App() {
                 </div>
               </div>
             </div>
+          )}
+
+          {/* Auto-Control Entscheidungsprotokoll */}
+          {battery && settings?.auto_control_active === true && (
+            <AutoControlLog settings={settings} battery={battery} />
           )}
         </>
       )}

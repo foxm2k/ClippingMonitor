@@ -509,6 +509,13 @@ async def get_forecast():
         )
 
 
+@app.get("/api/auto_control/log")
+async def get_auto_control_log(limit: int = Query(default=120, ge=1, le=200)):
+    if auto_controller is None:
+        return []
+    return auto_controller.get_log(limit)
+
+
 @app.get("/api/auto_control/status")
 async def get_auto_control_status():
     if auto_controller is None:
