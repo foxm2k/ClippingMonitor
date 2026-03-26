@@ -19,6 +19,8 @@ services:
       context: ./backend
     container_name: clipping_backend
     restart: unless-stopped
+    depends_on:
+      - pocketbase
     environment:
       - POCKETBASE_URL=http://pocketbase:8090
     volumes:
