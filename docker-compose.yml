@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  pocketbase:
+    image: ghcr.io/muchobien/pocketbase:latest
+    container_name: clipping_pocketbase
+    restart: unless-stopped
+    volumes:
+      # Fester Pfad auf deinem Server für die bestehenden Windows-Daten
+      - /opt/clippingmonitor/pb_data:/pb_data 
+      # Migrationen kommen direkt aus dem Git-Repo
+      - ./database/pb_migrations:/pb_migrations
+    command: serve --dir=/pb_data --migrationsDir=/pb_migrations --http=0.0.0.0:8090
+    networks:
+      - internal
+
+  backend:
+    build: 
+      context: ./backend
+    container_name: clipping_backend
+    restart: unless-stopped
+    environment:
+      - POCKETBASE_URL=http://pocketbase:8090
+    volumes:
+      # Auch die Config legen wir sicherheitshalber fest auf den Server
+      - /opt/clippingmonitor/config:/app/config
+    networks:
+      - internal
+      - proxy
+
+  frontend:
+    build: 
+      context: ./frontend
+    container_name: clipping_frontend
+    restart: unless-stopped
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+  internal:
+    name: clipping_internal
