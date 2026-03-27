@@ -19,17 +19,16 @@ export default defineConfig({
         theme_color: '#838c3d',
         background_color: '#184457',
         display: 'standalone',
-        start_url: '/',
         icons: [
           {
-            src: 'web-app-manifest-192x192.png',
+            src: '/web-app-manifest-192x192.png',
             sizes: '192x192',
-            type: 'image/png'
+            type: 'image/png',
           },
           {
-            src: 'web-app-manifest-512x512.png',
+            src: '/web-app-manifest-512x512.png',
             sizes: '512x512',
-            type: 'image/png'
+            type: 'image/png',
           }
         ]
       }
