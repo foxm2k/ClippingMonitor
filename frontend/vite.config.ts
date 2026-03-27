@@ -11,7 +11,7 @@ export default defineConfig({
     VitePWA({
       registerType: 'autoUpdate',
       // Diese Dateien werden für die Offline-Nutzung gecached
-      includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'favicon.svg'],
+      includeAssets: ['favicon.ico', 'apple-touch-icon.png'],
       manifest: {
         name: 'pvmonitor',
         short_name: 'pvmonitor',
