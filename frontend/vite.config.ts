@@ -10,8 +10,6 @@ export default defineConfig({
     tailwindcss(),
     VitePWA({
       registerType: 'autoUpdate',
-      // Diese Dateien werden für die Offline-Nutzung gecached
-      includeAssets: ['favicon.ico', 'apple-touch-icon.png'],
       manifest: {
         name: 'pvmonitor',
         short_name: 'pvmonitor',
