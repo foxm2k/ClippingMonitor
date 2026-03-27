@@ -1,0 +1,11 @@
+
+Commit & Publish:
+git add .
+git commit -m "Kommentar"
+git push
+
+
+
+Hart zurücksetzen auf Stand aus Github:
+git fetch origin
+git reset --hard origin/main
