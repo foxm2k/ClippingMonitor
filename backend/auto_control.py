@@ -90,6 +90,14 @@ class AutoController:
         ))
         return result
 
+    def _check_should_write(self, target_pct: int) -> bool:
+        """Prüft, ob der neue Wert geschrieben werden soll (asymmetrische Hysterese)."""
+        # Höhere Werte sofort schreiben
+        if target_pct > self._current_inwrte:
+            return True
+        # Bei niedrigeren Werten muss die Hysterese greifen
+        return (self._current_inwrte - target_pct) >= HYSTERESIS_PCT
+
     def run_cycle(
         self,
         soc: float,
@@ -104,7 +112,7 @@ class AutoController:
         if battery_cap_kwh <= 0:
             return self._log_result(AutoControlResult(
                 inwrte_pct=100,
-                should_write=abs(100 - self._current_inwrte) >= HYSTERESIS_PCT,
+                should_write=self._check_should_write(100),
                 reason="Keine Batteriekapazität konfiguriert — Ladung ohne Einschränkung.",
                 energy_needed_kwh=0.0,
                 total_clipping_kwh=0.0,
@@ -121,7 +129,7 @@ class AutoController:
         # Edge Case: Batterie bereits voll
         if energy_needed_kwh <= 0:
             target_pct = 0
-            should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
+            should_write = self._check_should_write(target_pct)
             return self._log_result(AutoControlResult(
                 inwrte_pct=target_pct,
                 should_write=should_write,
@@ -172,7 +180,7 @@ class AutoController:
         # Edge Case: Kein Forecast verfügbar (Nacht, API-Fehler, etc.)
         if not future_slots:
             target_pct = 100
-            should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
+            should_write = self._check_should_write(target_pct)
             return self._log_result(AutoControlResult(
                 inwrte_pct=target_pct,
                 should_write=should_write,
@@ -248,16 +256,16 @@ class AutoController:
         # Ganzzahlig runden – Fronius WR akzeptiert nur int-Werte
         target_pct = round(target_pct)
 
-        # Schritt 7 — Hysterese
-        should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
+        # Schritt 7 — Hysterese (asymmetrisch: hoch → sofort, runter → mit Schwelle)
+        should_write = self._check_should_write(target_pct)
 
         # Reason-String zusammenbauen (menschenlesbar)
         total_planned = sum(s.charge_kwh for s in future_slots)
 
         if not should_write:
-            delta = abs(target_pct - self._current_inwrte)
+            delta = self._current_inwrte - target_pct
             reason = (
-                f"Berechneter Wert ({target_pct}%) weicht weniger als "
+                f"Berechneter Wert ({target_pct}%) ist nicht höher und weicht weniger als "
                 f"{HYSTERESIS_PCT:.0f}% vom aktuellen ({self._current_inwrte:.0f}%) ab "
                 f"(Δ {delta:.0f}%). Modbus-Schreibbefehl übersprungen."
             )
