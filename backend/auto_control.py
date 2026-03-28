@@ -212,7 +212,7 @@ class AutoController:
             ), soc, grid_power)
 
         # Kein Einspeiselimit konfiguriert → kein Clipping möglich
-        if export_limit_w <= 0:
+        if export_limit_w < 0:
             export_limit_w = float('inf')
 
         # === Schritt 2 — Forecast-Slots aufbereiten (nur Zukunft) ===
@@ -387,7 +387,7 @@ class AutoController:
         if not should_write:
             delta = self._current_inwrte - target_pct
             return (
-                f"Berechneter Wert ({target_pct}%) weicht weniger als "
+                f"Berechneter Wert ({target_pct}%) ist nicht höher und weicht weniger als "
                 f"{HYSTERESIS_PCT:.0f}% vom aktuellen ({self._current_inwrte}%) ab "
                 f"(Δ {delta}%). Modbus-Schreibbefehl übersprungen."
             )
