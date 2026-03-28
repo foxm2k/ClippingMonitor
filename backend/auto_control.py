@@ -293,7 +293,7 @@ class AutoController:
         else:
             reason = (
                 f"Laut Plan soll die Batterie in diesem Zeitfenster "
-                f"mit {plan_pct}% der max. Ladeleistung laden. "
+                f"mit {round(plan_pct)}% der max. Ladeleistung laden. "
                 f"Genug Clipping-Energie vorhanden "
                 f"({total_clipping_kwh:.1f} kWh verfügbar, "
                 f"{energy_needed_kwh:.1f} kWh benötigt)."
@@ -316,7 +316,7 @@ class AutoController:
         logger.info("AutoControl: %s | %s | %s", reason, plan_detail, plan_summary)
 
         return self._log_result(AutoControlResult(
-            inwrte_pct=target_pct,
+            inwrte_pct=target_pct if should_write else self._current_inwrte,
             should_write=should_write,
             reason=reason,
             energy_needed_kwh=energy_needed_kwh,
