@@ -9,9 +9,11 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 from pocketbase import PocketBase
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
 from auto_control import AutoController
 from modbus_service import FroniusModbusClient
@@ -100,6 +102,24 @@ FORECAST_CACHE_TTL = 900  # 15 Minuten in Sekunden
 
 _battery_status_cache: dict | None = None
 
+# ---------------------------------------------------------------------------
+# SSE Broadcaster – eine asyncio.Queue pro verbundenem Client
+# ---------------------------------------------------------------------------
+_sse_clients: list[asyncio.Queue] = []
+
+
+async def broadcast_event(payload: dict) -> None:
+    """Schreibt ein Event-Payload in alle aktiven Client-Queues."""
+    msg = json.dumps(payload)
+    disconnected: list[asyncio.Queue] = []
+    for q in _sse_clients:
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            disconnected.append(q)
+    for q in disconnected:
+        _sse_clients.remove(q)
+
 
 async def poll_and_store_data():
     """Fragt zyklisch den Wechselrichter ab und speichert die Daten in PocketBase."""
@@ -123,7 +143,17 @@ async def poll_and_store_data():
             )
             logger.info("Gespeichert in PocketBase (ID: %s)", record.id)
 
+            # SSE: Live-Daten + Chart-Signal an alle Clients senden
+            live_record = {
+                "id": record.id,
+                "created": _format_created(record.created),
+                **parsed,
+            }
+            await broadcast_event({"type": "live", "data": live_record})
+            await broadcast_event({"type": "chart"})
+
             # Auto-Control prüfen
+            battery_changed = False
             try:
                 settings_response = await get_settings()
                 if (
@@ -158,6 +188,7 @@ async def poll_and_store_data():
                     )
 
                     logger.info("AutoControl: %s", ac_result.reason)
+                    await broadcast_event({"type": "autocontrol_log"})
 
                     if ac_result.should_write:
                         modbus_client = FroniusModbusClient()
@@ -166,6 +197,7 @@ async def poll_and_store_data():
                         )
                         if write_result.get("success"):
                             auto_controller.update_current_inwrte(ac_result.inwrte_pct)
+                            battery_changed = True
                             logger.info(
                                 "AutoControl: InWRte auf %.1f%% gesetzt",
                                 ac_result.inwrte_pct,
@@ -177,6 +209,16 @@ async def poll_and_store_data():
                             )
             except Exception:
                 logger.exception("Fehler im Auto-Control-Zyklus")
+
+            # SSE: Batterie-Status senden, wenn sich etwas geändert hat
+            if battery_changed:
+                try:
+                    modbus_fresh = FroniusModbusClient()
+                    batt_result = await modbus_fresh.get_battery_status()
+                    if batt_result.get("success"):
+                        await broadcast_event({"type": "battery", "data": batt_result})
+                except Exception:
+                    logger.exception("Fehler beim SSE-Broadcast des Batterie-Status")
 
         except httpx.ConnectError:
             logger.warning("Wechselrichter nicht erreichbar – überspringe Zyklus")
@@ -266,6 +308,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/events")
+async def sse_events(request: Request):
+    """SSE-Endpunkt: streamt Live-, Battery- und Chart-Events an den Browser."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    _sse_clients.append(queue)
+    logger.info("SSE-Client verbunden (%d aktive Clients)", len(_sse_clients))
+
+    async def event_generator():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield {"data": msg}
+                except asyncio.TimeoutError:
+                    # Keepalive-Kommentar, damit Nginx/Proxies die Verbindung nicht schließen
+                    yield {"comment": "keepalive"}
+        finally:
+            if queue in _sse_clients:
+                _sse_clients.remove(queue)
+            logger.info("SSE-Client getrennt (%d aktive Clients)", len(_sse_clients))
+
+    return EventSourceResponse(event_generator())
 
 
 @app.get("/api/history")
