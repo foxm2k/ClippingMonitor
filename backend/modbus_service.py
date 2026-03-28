@@ -76,10 +76,10 @@ class FroniusModbusClient:
             client.close()
             logger.info("Modbus-Verbindung geschlossen")
 
-    async def set_charge_limit(self, target_percentage: float) -> dict:
+    async def set_charge_limit(self, target_percentage: int) -> dict:
         """Setzt das Batterieladelimit (InWRte) ueber Modbus TCP.
 
-        target_percentage: Ladelimit in Prozent (z.B. 50.0 fuer 50%).
+        target_percentage: Ladelimit in Prozent (z.B. 50 fuer 50%), ganzzahlig.
         Liest den Scale Factor, berechnet den Rohwert und schreibt ihn.
         Liest anschliessend StorCtl_Mod und warnt, falls Ladelimit-Bit nicht aktiv.
         """
@@ -111,7 +111,7 @@ class FroniusModbusClient:
             # 2. Rohwert berechnen: raw_value = target_percentage * 10^(-sf)
             raw_value = int(round(target_percentage * (10 ** -sf)))
             logger.info(
-                "Schreibe InWRte: %d (%.1f%% mit SF=%d)", raw_value, target_percentage, sf
+                "Schreibe InWRte: %d (%d%% mit SF=%d)", raw_value, target_percentage, sf
             )
 
             # 3. Ladelimit schreiben (Register 40376, int16)
