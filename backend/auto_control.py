@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from collections import deque
 from dataclasses import dataclass
@@ -8,6 +10,7 @@ logger = logging.getLogger(__name__)
 SLOT_DURATION_HOURS = 0.25  # 15-Minuten-Slots (Open-Meteo Forecast-Raster)
 CHARGE_EFFICIENCY = 0.95  # AC→DC Ladeverlust
 HYSTERESIS_PCT = 3.0  # Modbus-Schreib-Schwelle in Prozentpunkten
+NIGHT_GAP_SLOTS = 8  # 8 × 15 min = 2h Lücke → Sonnenuntergang erkannt
 
 
 @dataclass
@@ -17,7 +20,7 @@ class ForecastSlot:
     clipping_w: float
     clipping_kwh: float
     total_kwh: float
-    charge_kwh: float = 0.0  # wird durch Allokation befüllt
+    charge_kwh: float = 0.0
 
 
 @dataclass
@@ -35,7 +38,7 @@ class AutoControlLogEntry:
     timestamp: str          # UTC ISO-8601
     soc: float              # SOC zum Zeitpunkt der Entscheidung
     grid_power: float       # Grid-Power zum Zeitpunkt
-    inwrte_pct: int          # Berechneter Zielwert (ganzzahlig)
+    inwrte_pct: int         # Berechneter Zielwert (ganzzahlig)
     should_write: bool      # Ob Modbus geschrieben wurde
     reason: str             # Entscheidungsbegründung
     energy_needed_kwh: float
@@ -44,7 +47,12 @@ class AutoControlLogEntry:
 
 
 class AutoController:
-    """Intelligente Batterie-Ladesteuerung basierend auf PV-Forecast."""
+    """Vorausschauende Batterie-Ladesteuerung basierend auf SOC-Trajektorie.
+
+    Statt reaktiver Rückwärts-Allokation wird eine gleichmäßige SOC-Anstiegskurve
+    vom aktuellen SOC auf 100% bis Sonnenuntergang berechnet. Ein SOC-abhängig
+    gedämpfter Proportional-Regler fängt Echtzeit-Überschuss sanft ab.
+    """
 
     def __init__(self):
         self._current_inwrte: int = 100  # Letzter geschriebener Wert (ganzzahlig)
@@ -91,12 +99,76 @@ class AutoController:
         return result
 
     def _check_should_write(self, target_pct: int) -> bool:
-        """Prüft, ob der neue Wert geschrieben werden soll (asymmetrische Hysterese)."""
-        # Höhere Werte sofort schreiben
+        """Prüft, ob der neue Wert geschrieben werden soll (asymmetrische Hysterese).
+
+        Höhere Werte → sofort schreiben.
+        Niedrigere Werte → nur bei ≥ HYSTERESIS_PCT Differenz.
+        """
         if target_pct > self._current_inwrte:
             return True
-        # Bei niedrigeren Werten muss die Hysterese greifen
         return (self._current_inwrte - target_pct) >= HYSTERESIS_PCT
+
+    def _make_result(self, target_pct: int, should_write: bool, **kwargs) -> AutoControlResult:
+        """Erzeugt AutoControlResult mit korrektem inwrte_pct.
+
+        WICHTIG: Wenn should_write=False, wird der alte Wert (_current_inwrte)
+        zurückgegeben, damit das Frontend keinen falschen neuen Wert anzeigt.
+        """
+        return AutoControlResult(
+            inwrte_pct=target_pct if should_write else self._current_inwrte,
+            should_write=should_write,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _calc_damping(soc: float) -> float:
+        """SOC-abhängiger Dämpfungsfaktor für den Echtzeit-Boost.
+
+        SOC < 50%  → aggressiv (0.9): Batterie ist leer, Überschuss schnell abfangen.
+        SOC 50-85% → linear abfallend (0.9 → 0.3): moderater werdende Korrektur.
+        SOC > 85%  → sanft (0.3 → 0.05): Batterie fast voll, kaum noch nachsteuern.
+        """
+        if soc < 50:
+            return 0.9
+        elif soc < 85:
+            # Linearer Übergang: 0.9 bei 50% → 0.3 bei 85%
+            return 0.9 - (soc - 50) / (85 - 50) * 0.6
+        else:
+            # Linearer Übergang: 0.3 bei 85% → 0.05 bei 100%
+            return max(0.05, 0.3 - (soc - 85) / (100 - 85) * 0.25)
+
+    @staticmethod
+    def _find_production_end(future_slots: list[ForecastSlot], now: datetime) -> datetime:
+        """Findet das Ende der heutigen PV-Produktion (≈ Sonnenuntergang).
+
+        Erkennt Sonnenuntergang an einer Lücke von ≥ 2h ohne Produktion.
+        Gibt den Endzeitpunkt des letzten produktiven Slots zurück.
+        """
+        last_productive_time = now
+        gap_count = 0
+        found_production = False
+
+        for slot in future_slots:
+            if slot.pv_w > 0:
+                try:
+                    slot_time = datetime.strptime(slot.time, "%Y-%m-%dT%H:%M").replace(
+                        tzinfo=timezone.utc
+                    )
+                except ValueError:
+                    continue
+                last_productive_time = slot_time + timedelta(minutes=15)
+                gap_count = 0
+                found_production = True
+            else:
+                gap_count += 1
+                if gap_count >= NIGHT_GAP_SLOTS and found_production:
+                    return last_productive_time
+
+        return last_productive_time
+
+    # ------------------------------------------------------------------
+    # Hauptlogik
+    # ------------------------------------------------------------------
 
     def run_cycle(
         self,
@@ -108,31 +180,31 @@ class AutoController:
         export_limit_w: float,
         safety_factor: float = 0.80,
     ) -> AutoControlResult:
-        # Edge Case: Kein Batterie-Kapazität konfiguriert
+        # === Edge Case: Keine Batterie-Kapazität konfiguriert ===
         if battery_cap_kwh <= 0:
-            return self._log_result(AutoControlResult(
-                inwrte_pct=100,
-                should_write=self._check_should_write(100),
+            target_pct = 100
+            should_write = self._check_should_write(target_pct)
+            return self._log_result(self._make_result(
+                target_pct, should_write,
                 reason="Keine Batteriekapazität konfiguriert — Ladung ohne Einschränkung.",
                 energy_needed_kwh=0.0,
                 total_clipping_kwh=0.0,
                 plan_summary="Keine Steuerung möglich (Kapazität nicht konfiguriert)",
             ), soc, grid_power)
 
-        # Schritt 1 — Energiebedarf
+        # === Schritt 1 — Energiebedarf ===
         energy_needed_kwh = battery_cap_kwh * (1 - soc / 100)
         logger.info(
             "AutoControl: SOC=%.1f%%, Energiebedarf=%.2f kWh",
             soc, energy_needed_kwh,
         )
 
-        # Edge Case: Batterie bereits voll
+        # === Edge Case: Batterie bereits voll ===
         if energy_needed_kwh <= 0:
             target_pct = 0
             should_write = self._check_should_write(target_pct)
-            return self._log_result(AutoControlResult(
-                inwrte_pct=target_pct,
-                should_write=should_write,
+            return self._log_result(self._make_result(
+                target_pct, should_write,
                 reason="Batterie ist voll (SOC 100%) — Ladung gestoppt.",
                 energy_needed_kwh=0.0,
                 total_clipping_kwh=0.0,
@@ -143,13 +215,12 @@ class AutoController:
         if export_limit_w <= 0:
             export_limit_w = float('inf')
 
-        # Schritt 2 — Forecast-Slots aufbereiten (nur Zukunft)
+        # === Schritt 2 — Forecast-Slots aufbereiten (nur Zukunft) ===
         now = datetime.now(timezone.utc)
         future_slots: list[ForecastSlot] = []
 
         for f in forecast:
             try:
-                # Open-Meteo-Format: "2024-03-22T10:00" (ohne Z)
                 slot_time = datetime.strptime(f["time"], "%Y-%m-%dT%H:%M").replace(
                     tzinfo=timezone.utc
                 )
@@ -177,152 +248,206 @@ class AutoController:
 
         total_clipping_kwh = sum(s.clipping_kwh for s in future_slots)
 
-        # Edge Case: Kein Forecast verfügbar (Nacht, API-Fehler, etc.)
+        # === Edge Case: Kein Forecast verfügbar (Nacht, API-Fehler, etc.) ===
         if not future_slots:
             target_pct = 100
             should_write = self._check_should_write(target_pct)
-            return self._log_result(AutoControlResult(
-                inwrte_pct=target_pct,
-                should_write=should_write,
+            return self._log_result(self._make_result(
+                target_pct, should_write,
                 reason="Kein Forecast verfügbar — Batterie lädt ohne Einschränkung.",
                 energy_needed_kwh=energy_needed_kwh,
                 total_clipping_kwh=0.0,
                 plan_summary="Kein Forecast — volle Ladung als Fallback",
             ), soc, grid_power)
 
-        # Schritt 3 — Rückwärts-Allokation: Clipping-Energie zuerst
-        remaining = energy_needed_kwh
-        for slot in reversed(future_slots):
-            alloc = min(remaining, slot.clipping_kwh)
-            slot.charge_kwh = alloc
-            remaining -= alloc
-            if remaining <= 0:
-                break
+        # === Schritt 3 — Vorab-Prüfung: Clipping vs. Bedarf ===
+        clipping_covers_need = total_clipping_kwh >= energy_needed_kwh
+        total_pv_kwh = sum(s.total_kwh for s in future_slots)
+        not_enough_sun = total_pv_kwh < energy_needed_kwh
 
-        # Schritt 4 — Falls remaining > 0, zweiter Rückwärts-Durchlauf (normaler Überschuss)
-        if remaining > 0:
-            for slot in reversed(future_slots):
-                headroom = slot.total_kwh - slot.charge_kwh
-                additional = min(remaining, headroom)
-                slot.charge_kwh += additional
-                remaining -= additional
-                if remaining <= 0:
-                    break
+        # === Schritt 4 — SOC-Trajektorie berechnen ===
+        #
+        # Idee: Gleichmäßige Linie vom aktuellen SOC zu 100% bei Sonnenuntergang.
+        # Daraus ergibt sich die benötigte Lade-Rate (%/h) und die Basis-Ladeleistung.
+        #
+        # Wenn das Clipping allein den Bedarf deckt, wird die Basis auf 0 gesetzt
+        # und nur der gedämpfte Echtzeit-Boost fängt den Überschuss ab.
+        #
+        production_end = self._find_production_end(future_slots, now)
+        hours_remaining = max(0.0, (production_end - now).total_seconds() / 3600)
 
-        # Falls remaining > 0: Nicht genug Sonne → alle Slots auf Maximum
-        not_enough_sun = remaining > 0
-        if not_enough_sun:
-            for slot in future_slots:
-                slot.charge_kwh = slot.total_kwh
+        if hours_remaining > 0.1 and not not_enough_sun:
+            # Gleichmäßige SOC-Steigung: aktueller SOC → 100% bis Sonnenuntergang
+            soc_rate_per_hour = (100 - soc) / hours_remaining  # %/h
 
-        # Schritt 5 — InWRte für aktuellen Slot bestimmen
-        current_slot = self._find_current_slot(future_slots, now)
-
-        if current_slot is None:
-            target_pct = 100
-            plan_detail = "Kein aktiver Slot"
-        else:
-            if SLOT_DURATION_HOURS > 0 and CHARGE_EFFICIENCY > 0:
-                target_w = (
-                    current_slot.charge_kwh
-                    / SLOT_DURATION_HOURS
-                    / CHARGE_EFFICIENCY
-                    * 1000
-                )
-            else:
-                target_w = 0.0
-
-            if wchamax_watt > 0:
-                target_pct = (target_w / wchamax_watt) * 100
-            else:
-                target_pct = 100
-
-            target_pct = max(0, min(100, target_pct))
-            plan_detail = (
-                f"Slot {current_slot.time}: "
-                f"charge={current_slot.charge_kwh:.2f}kWh → {target_w:.0f}W → {target_pct:.0f}%"
+            # Benötigte AC-Leistung (W) für diese SOC-Rate:
+            # DC-Energie/h = battery_cap_kwh × (soc_rate / 100)
+            # AC-Leistung  = DC-Energie/h / CHARGE_EFFICIENCY × 1000
+            base_power_w = (
+                battery_cap_kwh * soc_rate_per_hour / 100
+                / CHARGE_EFFICIENCY
+                * 1000
             )
 
-        plan_pct = target_pct  # bereits ganzzahlig
+            base_pct = (base_power_w / wchamax_watt) * 100 if wchamax_watt > 0 else 100
+        elif not_enough_sun:
+            # Nicht genug Sonne → maximale Ladung, jede kWh zählt
+            base_pct = 100.0
+            soc_rate_per_hour = 0.0
+        else:
+            # Kaum noch Zeit (< 6 min) → maximale Ladung
+            base_pct = 100.0
+            soc_rate_per_hour = 0.0
 
-        # Schritt 6 — Echtzeit-Korrektur (reaktiv)
+        # Clipping deckt den Bedarf → Basis streng auf 0%, nur Überschuss abfangen
+        if clipping_covers_need and not not_enough_sun:
+            base_pct = 0.0
+
+        base_pct = max(0.0, min(100.0, base_pct))
+
+        # === Schritt 5 — Gedämpfte Echtzeit-Korrektur (Proportional-Regler) ===
+        #
+        # Wenn die Netzeinspeisung über dem Limit liegt, wird ein Boost aufgerechnet.
+        # Der Boost wird mit einem SOC-abhängigen Faktor gedämpft:
+        #   - Batterie leer  → aggressiverer Boost (viel Platz)
+        #   - Batterie voll  → sanfter Boost (fast kein Platz, Spitzen vermeiden)
+        #
+        target_pct = base_pct
         boost_pct = 0.0
+        damping = self._calc_damping(soc)
         actual_export = max(0.0, -grid_power)
-        if actual_export > export_limit_w and export_limit_w > 0:
+
+        if actual_export > export_limit_w and export_limit_w > 0 and wchamax_watt > 0:
             overshoot_w = actual_export - export_limit_w
-            boost_pct = (overshoot_w / wchamax_watt) * 100 if wchamax_watt > 0 else 0.0
-            target_pct = min(100, target_pct + boost_pct)
+            raw_boost_pct = (overshoot_w / wchamax_watt) * 100
+            boost_pct = raw_boost_pct * damping
+            target_pct = min(100.0, target_pct + boost_pct)
 
-        # Ganzzahlig runden – Fronius WR akzeptiert nur int-Werte
-        target_pct = round(target_pct)
+        # === Ganzzahlig runden — Fronius WR akzeptiert nur int-Werte ===
+        target_pct = max(0, min(100, round(target_pct)))
 
-        # Schritt 7 — Hysterese (asymmetrisch: hoch → sofort, runter → mit Schwelle)
+        # === Schritt 6 — Hysterese (hoch → sofort, runter → mit Schwelle) ===
         should_write = self._check_should_write(target_pct)
 
-        # Reason-String zusammenbauen (menschenlesbar)
-        total_planned = sum(s.charge_kwh for s in future_slots)
-
-        if not should_write:
-            delta = self._current_inwrte - target_pct
-            reason = (
-                f"Berechneter Wert ({target_pct}%) ist nicht höher und weicht weniger als "
-                f"{HYSTERESIS_PCT:.0f}% vom aktuellen ({self._current_inwrte:.0f}%) ab "
-                f"(Δ {delta:.0f}%). Modbus-Schreibbefehl übersprungen."
-            )
-        elif boost_pct > 0 and plan_pct <= 0:
-            reason = (
-                f"Laut Plan wäre hier keine Ladung nötig (0%) — "
-                f"spätere Zeitfenster reichen aus. "
-                f"ABER: Einspeisung liegt gerade ~{actual_export - export_limit_w:.0f} W "
-                f"über dem Limit → Sofort-Korrektur um +{round(boost_pct)}%, "
-                f"damit der Überschuss in die Batterie fließt statt ins Netz."
-            )
-        elif boost_pct > 0:
-            reason = (
-                f"Laut Plan soll die Batterie mit {round(plan_pct)}% laden. "
-                f"Zusätzlich liegt die Einspeisung ~{actual_export - export_limit_w:.0f} W "
-                f"über dem Limit → Boost um +{round(boost_pct)}% auf insgesamt {target_pct}%."
-            )
-        elif not_enough_sun:
-            reason = (
-                f"Nicht genug Sonne für die volle Ladung! "
-                f"Nur {total_planned:.1f} kWh verfügbar, "
-                f"aber {energy_needed_kwh:.1f} kWh benötigt. "
-                f"Batterie lädt mit maximaler Leistung."
-            )
-        else:
-            reason = (
-                f"Laut Plan soll die Batterie in diesem Zeitfenster "
-                f"mit {round(plan_pct)}% der max. Ladeleistung laden. "
-                f"Genug Clipping-Energie vorhanden "
-                f"({total_clipping_kwh:.1f} kWh verfügbar, "
-                f"{energy_needed_kwh:.1f} kWh benötigt)."
-            )
-
-        # Plan-Summary (Kurzfassung)
-        if not_enough_sun:
-            plan_summary = (
-                f"Nicht genug Sonne! Bedarf: {energy_needed_kwh:.1f} kWh, "
-                f"verfügbar: {total_planned:.1f} kWh "
-                f"(Clipping: {total_clipping_kwh:.1f} kWh)"
-            )
-        else:
-            plan_summary = (
-                f"Bedarf: {energy_needed_kwh:.1f} kWh, "
-                f"geplant: {total_planned:.1f} kWh "
-                f"(Clipping: {total_clipping_kwh:.1f} kWh)"
-            )
-
-        logger.info("AutoControl: %s | %s | %s", reason, plan_detail, plan_summary)
-
-        return self._log_result(AutoControlResult(
-            inwrte_pct=target_pct if should_write else self._current_inwrte,
+        # === Reason & Plan-Summary aufbauen ===
+        reason = self._build_reason(
+            soc=soc,
+            target_pct=target_pct,
+            base_pct=round(base_pct),
+            boost_pct=boost_pct,
+            damping=damping,
+            actual_export=actual_export,
+            export_limit_w=export_limit_w,
+            clipping_covers_need=clipping_covers_need,
+            not_enough_sun=not_enough_sun,
+            hours_remaining=hours_remaining,
+            soc_rate_per_hour=soc_rate_per_hour,
+            energy_needed_kwh=energy_needed_kwh,
+            total_clipping_kwh=total_clipping_kwh,
+            total_pv_kwh=total_pv_kwh,
             should_write=should_write,
+        )
+
+        plan_summary = self._build_plan_summary(
+            soc=soc,
+            hours_remaining=hours_remaining,
+            soc_rate_per_hour=soc_rate_per_hour,
+            energy_needed_kwh=energy_needed_kwh,
+            total_clipping_kwh=total_clipping_kwh,
+            total_pv_kwh=total_pv_kwh,
+            clipping_covers_need=clipping_covers_need,
+            not_enough_sun=not_enough_sun,
+        )
+
+        logger.info(
+            "AutoControl: target=%d%% base=%.0f%% boost=%.1f%% damping=%.0f%% | %s",
+            target_pct, base_pct, boost_pct, damping * 100, plan_summary,
+        )
+
+        return self._log_result(self._make_result(
+            target_pct, should_write,
             reason=reason,
             energy_needed_kwh=energy_needed_kwh,
             total_clipping_kwh=total_clipping_kwh,
             plan_summary=plan_summary,
         ), soc, grid_power)
+
+    # ------------------------------------------------------------------
+    # Reason / Plan-Summary Builder
+    # ------------------------------------------------------------------
+
+    def _build_reason(
+        self, *, soc, target_pct, base_pct, boost_pct, damping,
+        actual_export, export_limit_w, clipping_covers_need,
+        not_enough_sun, hours_remaining, soc_rate_per_hour,
+        energy_needed_kwh, total_clipping_kwh, total_pv_kwh,
+        should_write,
+    ) -> str:
+        # Hysterese hat gegriffen → Schreiben übersprungen
+        if not should_write:
+            delta = self._current_inwrte - target_pct
+            return (
+                f"Berechneter Wert ({target_pct}%) weicht weniger als "
+                f"{HYSTERESIS_PCT:.0f}% vom aktuellen ({self._current_inwrte}%) ab "
+                f"(Δ {delta}%). Modbus-Schreibbefehl übersprungen."
+            )
+
+        parts = []
+
+        # Hauptgrund: Warum wurde dieser Basiswert gewählt?
+        if not_enough_sun:
+            parts.append(
+                f"Nicht genug Sonne für volle Ladung! "
+                f"Nur {total_pv_kwh:.1f} kWh verfügbar, "
+                f"aber {energy_needed_kwh:.1f} kWh benötigt "
+                f"→ volle Ladeleistung ({target_pct}%)."
+            )
+        elif clipping_covers_need:
+            parts.append(
+                f"Clipping-Energie reicht aus ({total_clipping_kwh:.1f} kWh ≥ "
+                f"{energy_needed_kwh:.1f} kWh Bedarf) "
+                f"→ Basis-Ladung 0%, nur Überschuss wird abgefangen."
+            )
+        else:
+            parts.append(
+                f"SOC-Trajektorie: {soc:.0f}% → 100% in {hours_remaining:.1f}h "
+                f"(+{soc_rate_per_hour:.1f}%/h) → Basis-Ladung {base_pct}%."
+            )
+
+        # Boost-Info (nur wenn tatsächlich aktiv)
+        if boost_pct > 0.5:
+            overshoot_w = actual_export - export_limit_w
+            parts.append(
+                f"Einspeisung liegt {overshoot_w:.0f} W über Limit "
+                f"→ gedämpfter Boost +{boost_pct:.0f}% "
+                f"(Dämpfung {damping * 100:.0f}% bei SOC {soc:.0f}%)."
+            )
+
+        return " ".join(parts)
+
+    @staticmethod
+    def _build_plan_summary(
+        *, soc, hours_remaining, soc_rate_per_hour,
+        energy_needed_kwh, total_clipping_kwh, total_pv_kwh,
+        clipping_covers_need, not_enough_sun,
+    ) -> str:
+        if not_enough_sun:
+            return (
+                f"Nicht genug Sonne! Bedarf: {energy_needed_kwh:.1f} kWh, "
+                f"verfügbar: {total_pv_kwh:.1f} kWh"
+            )
+
+        mode = "Nur Clipping" if clipping_covers_need else "Trajektorie"
+        return (
+            f"{mode}: {soc:.0f}% → 100% in {hours_remaining:.1f}h "
+            f"(+{soc_rate_per_hour:.1f}%/h) | "
+            f"Bedarf: {energy_needed_kwh:.1f} kWh, "
+            f"Clipping: {total_clipping_kwh:.1f} kWh"
+        )
+
+    # ------------------------------------------------------------------
+    # Hilfsmethoden
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _find_current_slot(
