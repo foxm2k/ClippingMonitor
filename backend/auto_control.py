@@ -274,7 +274,7 @@ class AutoController:
         # und nur der gedämpfte Echtzeit-Boost fängt den Überschuss ab.
         #
         production_end = self._find_production_end(future_slots, now)
-        hours_remaining = max(0.0, (production_end - now).total_seconds() / 3600)
+        hours_remaining = max(0.0, (production_end - now).total_seconds() / 3600 - 1.5)
 
         if hours_remaining > 0.1 and not not_enough_sun:
             # Gleichmäßige SOC-Steigung: aktueller SOC → 100% bis Sonnenuntergang
