@@ -22,7 +22,7 @@ class ForecastSlot:
 
 @dataclass
 class AutoControlResult:
-    inwrte_pct: float
+    inwrte_pct: int
     should_write: bool
     reason: str
     energy_needed_kwh: float
@@ -35,7 +35,7 @@ class AutoControlLogEntry:
     timestamp: str          # UTC ISO-8601
     soc: float              # SOC zum Zeitpunkt der Entscheidung
     grid_power: float       # Grid-Power zum Zeitpunkt
-    inwrte_pct: float       # Berechneter Zielwert
+    inwrte_pct: int          # Berechneter Zielwert (ganzzahlig)
     should_write: bool      # Ob Modbus geschrieben wurde
     reason: str             # Entscheidungsbegründung
     energy_needed_kwh: float
@@ -47,12 +47,12 @@ class AutoController:
     """Intelligente Batterie-Ladesteuerung basierend auf PV-Forecast."""
 
     def __init__(self):
-        self._current_inwrte: float = 100.0  # Letzter geschriebener Wert
+        self._current_inwrte: int = 100  # Letzter geschriebener Wert (ganzzahlig)
         self._log: deque[AutoControlLogEntry] = deque(maxlen=200)
 
-    def update_current_inwrte(self, pct: float):
+    def update_current_inwrte(self, pct: int):
         """Wird nach erfolgreichem Modbus-Write aufgerufen."""
-        self._current_inwrte = pct
+        self._current_inwrte = int(pct)
 
     def get_log(self, limit: int = 120) -> list[dict]:
         """Gibt die letzten `limit` Einträge zurück, neueste zuerst."""
@@ -103,8 +103,8 @@ class AutoController:
         # Edge Case: Kein Batterie-Kapazität konfiguriert
         if battery_cap_kwh <= 0:
             return self._log_result(AutoControlResult(
-                inwrte_pct=100.0,
-                should_write=abs(100.0 - self._current_inwrte) >= HYSTERESIS_PCT,
+                inwrte_pct=100,
+                should_write=abs(100 - self._current_inwrte) >= HYSTERESIS_PCT,
                 reason="Keine Batteriekapazität konfiguriert — Ladung ohne Einschränkung.",
                 energy_needed_kwh=0.0,
                 total_clipping_kwh=0.0,
@@ -120,7 +120,7 @@ class AutoController:
 
         # Edge Case: Batterie bereits voll
         if energy_needed_kwh <= 0:
-            target_pct = 0.0
+            target_pct = 0
             should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
             return self._log_result(AutoControlResult(
                 inwrte_pct=target_pct,
@@ -171,7 +171,7 @@ class AutoController:
 
         # Edge Case: Kein Forecast verfügbar (Nacht, API-Fehler, etc.)
         if not future_slots:
-            target_pct = 100.0
+            target_pct = 100
             should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
             return self._log_result(AutoControlResult(
                 inwrte_pct=target_pct,
@@ -211,7 +211,7 @@ class AutoController:
         current_slot = self._find_current_slot(future_slots, now)
 
         if current_slot is None:
-            target_pct = 100.0
+            target_pct = 100
             plan_detail = "Kein aktiver Slot"
         else:
             if SLOT_DURATION_HOURS > 0 and CHARGE_EFFICIENCY > 0:
@@ -227,15 +227,15 @@ class AutoController:
             if wchamax_watt > 0:
                 target_pct = (target_w / wchamax_watt) * 100
             else:
-                target_pct = 100.0
+                target_pct = 100
 
-            target_pct = max(0.0, min(100.0, target_pct))
+            target_pct = max(0, min(100, target_pct))
             plan_detail = (
                 f"Slot {current_slot.time}: "
-                f"charge={current_slot.charge_kwh:.2f}kWh → {target_w:.0f}W → {target_pct:.1f}%"
+                f"charge={current_slot.charge_kwh:.2f}kWh → {target_w:.0f}W → {target_pct:.0f}%"
             )
 
-        plan_pct = target_pct
+        plan_pct = target_pct  # bereits ganzzahlig
 
         # Schritt 6 — Echtzeit-Korrektur (reaktiv)
         boost_pct = 0.0
@@ -243,7 +243,10 @@ class AutoController:
         if actual_export > export_limit_w and export_limit_w > 0:
             overshoot_w = actual_export - export_limit_w
             boost_pct = (overshoot_w / wchamax_watt) * 100 if wchamax_watt > 0 else 0.0
-            target_pct = min(100.0, target_pct + boost_pct)
+            target_pct = min(100, target_pct + boost_pct)
+
+        # Ganzzahlig runden – Fronius WR akzeptiert nur int-Werte
+        target_pct = round(target_pct)
 
         # Schritt 7 — Hysterese
         should_write = abs(target_pct - self._current_inwrte) >= HYSTERESIS_PCT
@@ -254,23 +257,23 @@ class AutoController:
         if not should_write:
             delta = abs(target_pct - self._current_inwrte)
             reason = (
-                f"Berechneter Wert ({target_pct:.1f}%) weicht weniger als "
-                f"{HYSTERESIS_PCT:.0f}% vom aktuellen ({self._current_inwrte:.1f}%) ab "
-                f"(Δ {delta:.1f}%). Modbus-Schreibbefehl übersprungen."
+                f"Berechneter Wert ({target_pct}%) weicht weniger als "
+                f"{HYSTERESIS_PCT:.0f}% vom aktuellen ({self._current_inwrte:.0f}%) ab "
+                f"(Δ {delta:.0f}%). Modbus-Schreibbefehl übersprungen."
             )
         elif boost_pct > 0 and plan_pct <= 0:
             reason = (
                 f"Laut Plan wäre hier keine Ladung nötig (0%) — "
                 f"spätere Zeitfenster reichen aus. "
                 f"ABER: Einspeisung liegt gerade ~{actual_export - export_limit_w:.0f} W "
-                f"über dem Limit → Sofort-Korrektur um +{boost_pct:.1f}%, "
+                f"über dem Limit → Sofort-Korrektur um +{round(boost_pct)}%, "
                 f"damit der Überschuss in die Batterie fließt statt ins Netz."
             )
         elif boost_pct > 0:
             reason = (
-                f"Laut Plan soll die Batterie mit {plan_pct:.1f}% laden. "
+                f"Laut Plan soll die Batterie mit {round(plan_pct)}% laden. "
                 f"Zusätzlich liegt die Einspeisung ~{actual_export - export_limit_w:.0f} W "
-                f"über dem Limit → Boost um +{boost_pct:.1f}% auf insgesamt {target_pct:.1f}%."
+                f"über dem Limit → Boost um +{round(boost_pct)}% auf insgesamt {target_pct}%."
             )
         elif not_enough_sun:
             reason = (
@@ -282,7 +285,7 @@ class AutoController:
         else:
             reason = (
                 f"Laut Plan soll die Batterie in diesem Zeitfenster "
-                f"mit {plan_pct:.1f}% der max. Ladeleistung laden. "
+                f"mit {plan_pct}% der max. Ladeleistung laden. "
                 f"Genug Clipping-Energie vorhanden "
                 f"({total_clipping_kwh:.1f} kWh verfügbar, "
                 f"{energy_needed_kwh:.1f} kWh benötigt)."
@@ -305,7 +308,7 @@ class AutoController:
         logger.info("AutoControl: %s | %s | %s", reason, plan_detail, plan_summary)
 
         return self._log_result(AutoControlResult(
-            inwrte_pct=round(target_pct, 1),
+            inwrte_pct=target_pct,
             should_write=should_write,
             reason=reason,
             energy_needed_kwh=energy_needed_kwh,

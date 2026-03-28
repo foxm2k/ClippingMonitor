@@ -199,7 +199,7 @@ async def poll_and_store_data():
                             auto_controller.update_current_inwrte(ac_result.inwrte_pct)
                             battery_changed = True
                             logger.info(
-                                "AutoControl: InWRte auf %.1f%% gesetzt",
+                                "AutoControl: InWRte auf %d%% gesetzt",
                                 ac_result.inwrte_pct,
                             )
                         else:
@@ -333,7 +333,14 @@ async def sse_events(request: Request):
                 _sse_clients.remove(queue)
             logger.info("SSE-Client getrennt (%d aktive Clients)", len(_sse_clients))
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/api/history")
