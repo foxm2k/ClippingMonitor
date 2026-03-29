@@ -1,0 +1,1 @@
+cd C:\Users\Andi\Dev\ClippingManager\frontend && npm run dev

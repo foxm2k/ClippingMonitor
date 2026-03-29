@@ -1,0 +1,1 @@
+cd C:\Users\Andi\Dev\ClippingManager\database && pocketbase.exe serve

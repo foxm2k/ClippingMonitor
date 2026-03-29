@@ -1,0 +1,1 @@
+cd C:\Users\Andi\Dev\ClippingManager\backend && .venv\Scripts\activate && uvicorn main:app --reload
