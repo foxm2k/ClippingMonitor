@@ -47,23 +47,23 @@ export function getTimeRange(filter: "24h" | "today" | "yesterday" | "tomorrow")
     return { start: start.toISOString(), end: now.toISOString() };
   }
 
-  const localDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const y = now.getFullYear(), m = now.getMonth(), d = now.getDate();
 
   if (filter === "today") {
-    const start = new Date(localDate);
-    const end = new Date(localDate.getTime() + 24 * 60 * 60 * 1000 - 1);
+    const start = new Date(y, m, d);
+    const end = new Date(new Date(y, m, d + 1).getTime() - 1);
     return { start: start.toISOString(), end: end.toISOString() };
   }
 
   if (filter === "yesterday") {
-    const start = new Date(localDate.getTime() - 24 * 60 * 60 * 1000);
-    const end = new Date(localDate.getTime() - 1);
+    const start = new Date(y, m, d - 1);
+    const end = new Date(new Date(y, m, d).getTime() - 1);
     return { start: start.toISOString(), end: end.toISOString() };
   }
 
   // tomorrow
-  const start = new Date(localDate.getTime() + 24 * 60 * 60 * 1000);
-  const end = new Date(localDate.getTime() + 48 * 60 * 60 * 1000 - 1);
+  const start = new Date(y, m, d + 1);
+  const end = new Date(new Date(y, m, d + 2).getTime() - 1);
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
