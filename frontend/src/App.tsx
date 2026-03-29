@@ -692,7 +692,20 @@ export default function App() {
       console.warn("SSE-Verbindung unterbrochen – Browser versucht automatisch Reconnect.");
     };
 
-    return () => eventSource.close();
+    const forecastInterval = setInterval(async () => {
+      try {
+        const newForecast = await fetchForecast();
+        forecastRef.current = newForecast;
+        loadChartData(activeFilterRef.current, forecastRef.current).catch(console.error);
+      } catch (err) {
+        console.error("Automatischer Forecast-Reload fehlgeschlagen:", err);
+      }
+    }, 15 * 60 * 1000);
+
+    return () => {
+      clearInterval(forecastInterval);
+      eventSource.close();
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
