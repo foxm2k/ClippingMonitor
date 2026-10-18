@@ -10,6 +10,8 @@ export default defineConfig({
     tailwindcss(),
     VitePWA({
       registerType: 'autoUpdate',
+      // Seite liegt hinter einem Login – ohne Credentials liefert der Proxy 401 fürs Manifest
+      useCredentials: true,
       manifest: {
         name: 'pvmonitor',
         short_name: 'pvmonitor',
