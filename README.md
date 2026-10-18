@@ -228,6 +228,15 @@ Ergebnis: Batterie lädt erst ab 12:00 statt sofort → spät geladen ✓
 | `GET` | `/api/battery/status` | Batterie-Status via Modbus (SOC, Limits, Modus) |
 | `POST` | `/api/battery/charge_limit` | Ladelimit setzen (`{"limit_pct": 50.0}`) |
 
+### Batterie-Zustand
+
+| Methode | Endpoint | Beschreibung |
+|---|---|---|
+| `GET` | `/api/battery/health` | Letzter Batterie-Zustand (Modus, SoH, Zelltemperaturen, Zellspannungen, Zyklen, WR-Status) – wird alle 60 s aktualisiert |
+| `GET` | `/api/battery/events?limit=50` | Batterie-Ereignisprotokoll (Modus-/Statuswechsel, Schwellwerte) aus PocketBase |
+
+Datenquelle ist die interne, undokumentierte WR-API `/api/components/readable` (ohne Login). Fällt sie aus, nutzt das Backend `GetStorageRealtimeData.cgi` der Solar API (ohne SoH und Zellspannungen). Messwerte landen alle 5 min in `battery_health_logs`, Ereignisse sofort in `battery_events`. Basis-URL über `FRONIUS_BASE_URL` (Default: Schema und Host aus `FRONIUS_URL`). Fehlende Werte werden in PocketBase als 0/false gespeichert (die Zahlen- und Bool-Felder kennen kein NULL); das Feld `source` kennzeichnet Datensätze aus dem Fallback.
+
 ### System
 
 | Methode | Endpoint | Beschreibung |

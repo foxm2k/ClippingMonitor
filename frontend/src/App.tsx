@@ -12,9 +12,11 @@ import {
   ReferenceArea,
 } from "recharts";
 import { Sun, Home, Zap, Battery, Settings, Bot, RefreshCw } from "lucide-react";
+import { isAxiosError } from "axios";
 import api from "./api";
-import type { AppSettings, ForecastPoint, PowerLog, TimeRange } from "./api";
-import { fetchSettings, updateSettings, fetchHistory, fetchLatest, fetchForecast, getTimeRange, setChargeLimit } from "./api";
+import type { AppSettings, BatteryHealth, ForecastPoint, PowerLog, TimeRange } from "./api";
+import { fetchSettings, updateSettings, fetchHistory, fetchLatest, fetchForecast, getTimeRange, setChargeLimit, fetchBatteryHealth } from "./api";
+import { BatteryHealthCard, BatteryEventLog } from "./BatteryHealth";
 
 interface BatteryStatus {
   success: boolean;
@@ -56,6 +58,11 @@ function yAxisTickFormatter(val: number): string {
   return `${val} W`;
 }
 
+// Nur neuere Snapshots übernehmen (Initial-Abruf und SSE können sich überholen)
+function pickNewerHealth(prev: BatteryHealth | null, next: BatteryHealth): BatteryHealth {
+  return prev && Date.parse(prev.timestamp) >= Date.parse(next.timestamp) ? prev : next;
+}
+
 function StatCard({
   icon,
   label,
@@ -63,6 +70,7 @@ function StatCard({
   unit,
   color,
   extra,
+  badge,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -70,12 +78,18 @@ function StatCard({
   unit: string;
   color: string;
   extra?: string;
+  badge?: string;
 }) {
   return (
-    <div className="rounded-2xl bg-slate-800 p-5 flex flex-col gap-2">
-      <div className="flex items-center gap-2 text-sm text-slate-400">
+    <div className="rounded-2xl bg-slate-800 p-5 flex flex-col gap-2 min-w-0">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-slate-400">
         <span style={{ color }}>{icon}</span>
         {label}
+        {badge && (
+          <span className="ml-auto max-w-full truncate rounded-full bg-amber-400/15 px-2 py-0.5 text-xs text-amber-300 capitalize">
+            {badge}
+          </span>
+        )}
       </div>
       <div className="text-2xl font-semibold text-white">
         {value}{" "}
@@ -573,6 +587,8 @@ export default function App() {
   const [live, setLive] = useState<PowerLog | null>(null);
   const [battery, setBattery] = useState<BatteryStatus | null>(null);
   const [logTrigger, setLogTrigger] = useState(0);
+  const [health, setHealth] = useState<BatteryHealth | null>(null);
+  const [batteryEventTrigger, setBatteryEventTrigger] = useState(0);
   const [activeFilter, setActiveFilter] = useState<FilterMode>("today");
   const [hiddenLines, setHiddenLines] = useState<Set<string>>(() => {
     try {
@@ -657,6 +673,13 @@ export default function App() {
       .catch((e) => console.error("Settings-Abruf fehlgeschlagen", e));
 
     init();
+    // 503 bis zum ersten Poll ist normal – danach kommt der Wert per SSE
+    fetchBatteryHealth()
+      .then((h) => setHealth((prev) => pickNewerHealth(prev, h)))
+      .catch((err) => {
+        if (isAxiosError(err) && err.response?.status === 503) return;
+        console.error("Batterie-Zustand konnte nicht geladen werden:", err);
+      });
 
     // SSE: Echtzeit-Updates statt Polling
     const baseUrl = import.meta.env.VITE_API_BASE_URL || "";
@@ -682,6 +705,14 @@ export default function App() {
 
         if (payload.type === "autocontrol_log") {
           setLogTrigger((prev) => prev + 1);
+        }
+
+        if (payload.type === "battery_health" && payload.data) {
+          setHealth((prev) => pickNewerHealth(prev, payload.data as BatteryHealth));
+        }
+
+        if (payload.type === "battery_event") {
+          setBatteryEventTrigger((prev) => prev + 1);
         }
       } catch (err) {
         console.error("SSE message parse error:", err);
@@ -852,6 +883,7 @@ export default function App() {
               unit={battFormatted.unit}
               color="#4ade80"
               extra={`Ladestand: ${battSoc.toFixed(0)} %${settings && settings.battery_capacity_kwh > 0 ? ` ≈ ${(battSoc / 100 * settings.battery_capacity_kwh).toFixed(1)} kWh` : ""}`}
+              badge={health?.battery_mode && health.battery_mode !== "normal" ? health.battery_mode : undefined}
             />
           </div>
 
@@ -1044,6 +1076,11 @@ export default function App() {
             </ResponsiveContainer>
           </div>
 
+          {/* Batterie-Zustand */}
+          {health && (
+            <BatteryHealthCard health={health} timezone={settings?.timezone ?? "Europe/Berlin"} />
+          )}
+
           {/* Modbus Batterie-Steuerung */}
           {battery && (
             <div className="rounded-2xl bg-slate-800 p-6 mt-6">
@@ -1097,6 +1134,12 @@ export default function App() {
           {battery && settings?.auto_control_active === true && (
             <AutoControlLog settings={settings} battery={battery} refreshTrigger={logTrigger} />
           )}
+
+          {/* Batterie-Ereignisprotokoll (immer sichtbar) */}
+          <BatteryEventLog
+            timezone={settings?.timezone ?? "Europe/Berlin"}
+            refreshTrigger={batteryEventTrigger}
+          />
         </>
       )}
 
