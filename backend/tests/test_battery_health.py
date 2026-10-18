@@ -9,6 +9,9 @@ from battery_health import (
     parse_inverter_info,
     parse_powerflow_battery,
     parse_storage_realtime,
+    soh_level,
+    spread_level,
+    temp_level,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -101,3 +104,39 @@ def test_parse_inverter_info():
         "inverter_status_code": 7,
         "inverter_error_code": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Level
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("temp, expected", [
+    (20.0, "ok"), (5.0, "ok"), (40.0, "ok"),
+    (4.9, "warn"), (40.1, "warn"),
+    (-0.1, "crit"), (50.1, "crit"),
+    (None, None),
+])
+def test_temp_level_thresholds(temp, expected):
+    assert temp_level(temp) == expected
+
+
+def test_temp_level_hysteresis():
+    # Zurueck in ein besseres Level erst mit 1 K Abstand zur Schwelle
+    assert temp_level(39.5, prev="warn") == "warn"
+    assert temp_level(38.9, prev="warn") == "ok"
+    assert temp_level(49.5, prev="crit") == "crit"
+    assert temp_level(48.0, prev="crit") == "warn"
+    assert temp_level(5.5, prev="warn") == "warn"
+    assert temp_level(6.1, prev="warn") == "ok"
+
+
+@pytest.mark.parametrize("soh, expected", [(99.7, "ok"), (80.0, "ok"), (79.9, "warn"), (None, None)])
+def test_soh_level(soh, expected):
+    assert soh_level(soh) == expected
+
+
+@pytest.mark.parametrize("mv, expected", [
+    (9.0, "ok"), (49.9, "ok"), (50.0, "warn"), (99.9, "warn"), (100.0, "crit"), (None, None),
+])
+def test_spread_level(mv, expected):
+    assert spread_level(mv) == expected

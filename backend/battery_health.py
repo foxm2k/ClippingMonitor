@@ -7,6 +7,18 @@ logger = logging.getLogger(__name__)
 
 WS_PER_KWH = 3_600_000  # Fronius-Energiezaehler liefern Wattsekunden
 
+# Warnschwellen (bestaetigt 2026-10-18)
+TEMP_WARN_LOW = 5.0
+TEMP_WARN_HIGH = 40.0
+TEMP_CRIT_LOW = 0.0
+TEMP_CRIT_HIGH = 50.0
+TEMP_HYSTERESIS = 1.0  # K – verhindert Flattern der Ereignisse an der Schwelle
+SOH_WARN = 80.0
+SPREAD_WARN_MV = 50.0
+SPREAD_CRIT_MV = 100.0
+
+LEVELS = ("ok", "warn", "crit")
+
 HEALTH_KEYS = (
     "soc",
     "soh",
@@ -202,3 +214,42 @@ def parse_inverter_info(raw: dict) -> dict:
         "inverter_status_code": _int(inv.get("StatusCode")),
         "inverter_error_code": _int(inv.get("ErrorCode")),
     }
+
+
+def _worst(levels) -> str:
+    return max(levels, key=LEVELS.index)
+
+
+def _temp_raw_level(temp: float, shift: float) -> str:
+    if temp < TEMP_CRIT_LOW + shift or temp > TEMP_CRIT_HIGH - shift:
+        return "crit"
+    if temp < TEMP_WARN_LOW + shift or temp > TEMP_WARN_HIGH - shift:
+        return "warn"
+    return "ok"
+
+
+def temp_level(temp: float | None, prev: str = "ok") -> str | None:
+    """Level einer Zelltemperatur. None = Wert fehlt (Level nicht aendern)."""
+    if temp is None:
+        return None
+    level = _temp_raw_level(temp, 0.0)
+    if LEVELS.index(level) < LEVELS.index(prev):
+        # Verbesserung erst akzeptieren, wenn TEMP_HYSTERESIS innerhalb der Grenze
+        level = _temp_raw_level(temp, TEMP_HYSTERESIS)
+    return level
+
+
+def soh_level(soh: float | None) -> str | None:
+    if soh is None:
+        return None
+    return "warn" if soh < SOH_WARN else "ok"
+
+
+def spread_level(spread_mv: float | None) -> str | None:
+    if spread_mv is None:
+        return None
+    if spread_mv >= SPREAD_CRIT_MV:
+        return "crit"
+    if spread_mv >= SPREAD_WARN_MV:
+        return "warn"
+    return "ok"
