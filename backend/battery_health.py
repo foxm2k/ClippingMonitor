@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,12 @@ SPREAD_WARN_MV = 50.0
 SPREAD_CRIT_MV = 100.0
 
 LEVELS = ("ok", "warn", "crit")
+
+PERSIST_INTERVAL = timedelta(minutes=5)
+
+COMPONENTS_PATH = "/api/components/readable"
+STORAGE_PATH = "/solar_api/v1/GetStorageRealtimeData.cgi"
+INVERTER_INFO_PATH = "/solar_api/v1/GetInverterInfo.cgi"
 
 HEALTH_KEYS = (
     "soc",
@@ -385,3 +394,64 @@ class BatteryEventDetector:
                 new_value=level,
             ))
         return events
+
+
+class PersistThrottle:
+    """Laesst DB-Schreibvorgaenge hoechstens alle PERSIST_INTERVAL zu."""
+
+    def __init__(self, interval: timedelta = PERSIST_INTERVAL):
+        self.interval = interval
+        self._last: datetime | None = None
+
+    def due(self, now: datetime) -> bool:
+        return self._last is None or now - self._last >= self.interval
+
+    def mark(self, now: datetime) -> None:
+        self._last = now
+
+
+def db_record(snapshot: dict) -> dict:
+    """PocketBase-Datensatz: nur bekannte Felder, fehlende Werte weglassen."""
+    return {k: snapshot[k] for k in DB_FIELDS if snapshot.get(k) is not None}
+
+
+async def _get_json(client: httpx.AsyncClient, url: str) -> dict:
+    response = await client.get(url)
+    response.raise_for_status()
+    return response.json()
+
+
+async def fetch_battery_health(
+    client: httpx.AsyncClient, base_url: str, powerflow_raw: dict
+) -> dict:
+    """Sammelt alle Batterie-Zustandswerte zu einem Snapshot.
+
+    Reihenfolge: Komponenten-API → Solar API → 'unavailable'.
+    Wirft nie – der Poll-Zyklus darf hieran nicht scheitern.
+    """
+    source = "unavailable"
+    health = _empty(HEALTH_KEYS)
+    try:
+        health = parse_components(await _get_json(client, base_url + COMPONENTS_PATH))
+        source = "components"
+    except Exception as e:
+        logger.warning("Komponenten-API nicht nutzbar (%s) – versuche Solar API", e)
+        try:
+            health = parse_storage_realtime(await _get_json(client, base_url + STORAGE_PATH))
+            source = "solar_api"
+        except Exception as e2:
+            logger.warning("Speicherdaten der Solar API nicht verfuegbar: %s", e2)
+
+    inverter = _empty(INVERTER_KEYS)
+    try:
+        inverter = parse_inverter_info(await _get_json(client, base_url + INVERTER_INFO_PATH))
+    except Exception as e:
+        logger.warning("Wechselrichter-Info nicht verfuegbar: %s", e)
+
+    return {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "source": source,
+        **parse_powerflow_battery(powerflow_raw),
+        **health,
+        **inverter,
+    }

@@ -1,12 +1,21 @@
+import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 
 from battery_health import (
+    COMPONENTS_PATH,
     DB_FIELDS,
     HEALTH_KEYS,
+    INVERTER_INFO_PATH,
+    STORAGE_PATH,
     BatteryEventDetector,
+    PersistThrottle,
+    db_record,
+    fetch_battery_health,
     parse_components,
     parse_inverter_info,
     parse_powerflow_battery,
@@ -251,3 +260,67 @@ def test_soh_and_spread_levels():
         ("soh", "warn", "ok", "warn"),
         ("cell_spread", "crit", "ok", "crit"),
     ])
+
+
+# ---------------------------------------------------------------------------
+# Drossel, DB-Datensatz, Abruf
+# ---------------------------------------------------------------------------
+
+def test_persist_throttle_every_five_minutes():
+    t = PersistThrottle()
+    t0 = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
+    assert t.due(t0)
+    t.mark(t0)
+    assert not t.due(t0 + timedelta(minutes=4, seconds=59))
+    assert t.due(t0 + timedelta(minutes=5))
+
+
+def test_db_record_drops_missing_and_extra_fields():
+    record = db_record({**snap(soh=None), "timestamp": "x", "levels": {}})
+    assert "soh" not in record
+    assert "timestamp" not in record and "levels" not in record
+    assert record["battery_mode"] == "normal"
+    assert set(record) <= set(DB_FIELDS)
+
+
+def run_fetch(routes: dict) -> dict:
+    def handler(request: httpx.Request) -> httpx.Response:
+        status, body = routes.get(request.url.path, (404, {}))
+        return httpx.Response(status, json=body)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await fetch_battery_health(client, "http://wr", load("powerflow.json"))
+
+    return asyncio.run(go())
+
+
+def test_fetch_uses_components_api():
+    s = run_fetch({
+        COMPONENTS_PATH: (200, load("components_readable.json")),
+        INVERTER_INFO_PATH: (200, load("inverter_info.json")),
+    })
+    assert s["source"] == "components"
+    assert s["soh"] == 99.7
+    assert s["battery_mode"] == "normal"
+    assert s["inverter_state"] == "Running"
+    assert set(DB_FIELDS) <= set(s)
+    assert s["timestamp"].endswith("Z")
+
+
+def test_fetch_falls_back_to_solar_api():
+    s = run_fetch({
+        COMPONENTS_PATH: (500, {}),
+        STORAGE_PATH: (200, load("storage_realtime.json")),
+    })
+    assert s["source"] == "solar_api"
+    assert s["temp_cell"] == 19.5
+    assert s["soh"] is None
+    assert s["inverter_state"] is None  # GetInverterInfo hier 404
+
+
+def test_fetch_all_sources_down():
+    s = run_fetch({})
+    assert s["source"] == "unavailable"
+    assert s["soc"] is None
+    assert s["battery_mode"] == "normal"  # kommt aus dem bereits geladenen PowerFlow
