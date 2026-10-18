@@ -4,6 +4,7 @@ import datetime
 import json
 import logging
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 
 import httpx
@@ -16,6 +17,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from auto_control import AutoController
+from battery_health import BatteryEventDetector, PersistThrottle, db_record, fetch_battery_health
 from modbus_service import FroniusModbusClient
 
 
@@ -34,6 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 FRONIUS_URL = os.getenv("FRONIUS_URL", "http://192.168.123.79/solar_api/v1/GetPowerFlowRealtimeData.fcgi")
+FRONIUS_BASE_URL = os.getenv("FRONIUS_BASE_URL", "http://192.168.123.79")
 POCKETBASE_URL = os.getenv("POCKETBASE_URL", "http://127.0.0.1:8090")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 POLL_INTERVAL = 60  # Sekunden
@@ -101,6 +104,9 @@ _forecast_cache_settings_key: tuple | None = None
 FORECAST_CACHE_TTL = 900  # 15 Minuten in Sekunden
 
 _battery_status_cache: dict | None = None
+_battery_health_cache: dict | None = None
+battery_event_detector = BatteryEventDetector()
+battery_persist_throttle = PersistThrottle()
 
 # ---------------------------------------------------------------------------
 # SSE Broadcaster – eine asyncio.Queue pro verbundenem Client
@@ -119,6 +125,34 @@ async def broadcast_event(payload: dict) -> None:
             disconnected.append(q)
     for q in disconnected:
         _sse_clients.remove(q)
+
+
+async def _process_battery_health(powerflow_raw: dict) -> None:
+    """Batterie-Zustand holen, an Clients senden, Ereignisse sofort und
+    Messwerte gedrosselt (alle 5 min) in PocketBase speichern."""
+    global _battery_health_cache
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        snapshot = await fetch_battery_health(client, FRONIUS_BASE_URL, powerflow_raw)
+
+    events = battery_event_detector.process(snapshot)
+    snapshot["levels"] = battery_event_detector.levels()
+    _battery_health_cache = snapshot
+    await broadcast_event({"type": "battery_health", "data": snapshot})
+
+    pb = PocketBase(POCKETBASE_URL)
+    for ev in events:
+        logger.info("Batterie-Ereignis [%s] %s", ev.severity, ev.message)
+        await asyncio.to_thread(pb.collection("battery_events").create, asdict(ev))
+    if events:
+        await broadcast_event({"type": "battery_event"})
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if battery_persist_throttle.due(now):
+        await asyncio.to_thread(
+            pb.collection("battery_health_logs").create, db_record(snapshot)
+        )
+        battery_persist_throttle.mark(now)
+        logger.info("Batterie-Zustand gespeichert (Quelle: %s)", snapshot["source"])
 
 
 async def poll_and_store_data():
@@ -151,6 +185,12 @@ async def poll_and_store_data():
             }
             await broadcast_event({"type": "live", "data": live_record})
             await broadcast_event({"type": "chart"})
+
+            # Batterie-Zustand – eigener Fehlerkontext, damit Auto-Control weiterlaeuft
+            try:
+                await _process_battery_health(raw_data)
+            except Exception:
+                logger.exception("Fehler beim Verarbeiten des Batterie-Zustands")
 
             # Auto-Control prüfen
             battery_changed = False
@@ -453,6 +493,44 @@ async def set_charge_limit(request: ChargeLimitRequest):
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": "Interner Fehler"},
+        )
+
+
+@app.get("/api/battery/health")
+async def get_battery_health():
+    if _battery_health_cache is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Noch keine Batterie-Zustandsdaten (erster Poll steht aus)"},
+        )
+    return _battery_health_cache
+
+
+@app.get("/api/battery/events")
+async def get_battery_events(limit: int = Query(default=50, ge=1, le=200)):
+    try:
+        pb = PocketBase(POCKETBASE_URL)
+        result = await asyncio.to_thread(
+            pb.collection("battery_events").get_list,
+            1, limit, {"sort": "-created"},
+        )
+        return [
+            {
+                "id": r.id,
+                "created": _format_created(r.created),
+                "category": r.category,
+                "severity": r.severity,
+                "message": r.message,
+                "old_value": r.old_value,
+                "new_value": r.new_value,
+            }
+            for r in result.items
+        ]
+    except Exception:
+        logger.exception("Fehler beim Abrufen der Batterie-Ereignisse")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Batterie-Ereignisse konnten nicht geladen werden"},
         )
 
 
