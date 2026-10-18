@@ -211,8 +211,8 @@ class AutoController:
                 plan_summary="Batterie voll — keine Ladung nötig",
             ), soc, grid_power)
 
-        # Kein Einspeiselimit konfiguriert → kein Clipping möglich
-        if export_limit_w < 0:
+        # Kein Einspeiselimit (0 %) oder keine Modulleistung konfiguriert → kein Clipping möglich
+        if export_limit_w <= 0:
             export_limit_w = float('inf')
 
         # === Schritt 2 — Forecast-Slots aufbereiten (nur Zukunft) ===

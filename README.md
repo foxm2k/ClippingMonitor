@@ -79,7 +79,7 @@ Zum Wechselrichter gehen zwei Kanäle: Modbus TCP für das Lesen und Schreiben d
 │   ├── modbus_service.py       # Modbus-TCP-Client (SunSpec)
 │   ├── config/
 │   │   └── settings.json       # Persistierte Einstellungen
-│   ├── tests/                  # pytest (Batterie-Zustand) inkl. WR-Fixtures
+│   ├── tests/                  # pytest (Batterie-Zustand, Auto-Control) inkl. WR-Fixtures
 │   ├── requirements.txt        # Laufzeit-Abhängigkeiten
 │   ├── requirements-dev.txt    # + pytest
 │   └── Dockerfile
@@ -207,7 +207,7 @@ Alle Einstellungen sind über das Settings-Tab im Dashboard konfigurierbar und w
 | Einstellung | Beschreibung | Default |
 |---|---|---|
 | `timezone` | Zeitzone für die Anzeige (Berlin, Wien, London, UTC) | `Europe/Berlin` |
-| `export_limit_percent` | Einspeiselimit in % der Modulleistung (`system_capacity_kwp`) | `0` |
+| `export_limit_percent` | Einspeiselimit in % der Modulleistung (`system_capacity_kwp`), 0 = kein Limit | `0` |
 | `auto_control_active` | Automatische Batteriesteuerung ein/aus | `false` |
 | `location_lat` / `location_lon` | Standort für Wetterprognose | `48.137` / `11.576` |
 | `panel_tilt` | Neigungswinkel der Module in Grad | `30` |
@@ -218,7 +218,7 @@ Alle Einstellungen sind über das Settings-Tab im Dashboard konfigurierbar und w
 | `system_efficiency` | Systemwirkungsgrad (0.5–1.0) | `0.85` |
 | `safety_factor` | Forecast-Sicherheitsfaktor (0.5–1.0) | `0.80` |
 
-Einspeiselimit in Watt = `system_capacity_kwp × 1000 × export_limit_percent / 100`. Die Auswertungen „über Limit“ im Dashboard erscheinen nur bei einem Wert unter 100 %.
+Einspeiselimit in Watt = `system_capacity_kwp × 1000 × export_limit_percent / 100`. Bei 0 %, 100 % oder ohne Modulleistung gibt es kein Limit: Die Auto-Control rechnet dann ohne Clipping, und das Dashboard blendet Limit-Linien und die Werte „über Limit“ aus. Eine Nulleinspeisung lässt sich damit nicht abbilden.
 
 ---
 

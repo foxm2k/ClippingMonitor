@@ -815,7 +815,13 @@ export default function App() {
   const battFormatted = formatPower(Math.abs(battPower));
   const battSoc = live?.battery_soc ?? 0;
 
-  const exportLimitWatts = settings
+  // 0 % = kein Limit, 100 % begrenzt nichts – nur dazwischen gibt es Clipping
+  const limitActive =
+    !!settings &&
+    settings.system_capacity_kwp > 0 &&
+    settings.export_limit_percent > 0 &&
+    settings.export_limit_percent < 100;
+  const exportLimitWatts = limitActive
     ? (settings.system_capacity_kwp * 1000) * (settings.export_limit_percent / 100)
     : null;
 
@@ -984,7 +990,7 @@ export default function App() {
             <span className="text-amber-400">
               ⚡ Erzeugt: {generatedKWh.toFixed(1)} kWh
             </span>
-            {settings && settings.export_limit_percent < 100 && (
+            {limitActive && (
               <span className="text-red-400">
                 ⚠️ Über Limit: {excessKWh.toFixed(1)} kWh
               </span>
@@ -993,7 +999,7 @@ export default function App() {
             <span className="text-amber-400/50">
               🌤️ Erwartet: {expectedKWh.toFixed(1)} kWh
             </span>
-            {settings && settings.export_limit_percent < 100 && (
+            {limitActive && (
               <span className="text-red-400/50">
                 🔮 Erwartet über Limit: {expectedExcessKWh.toFixed(1)} kWh
               </span>
@@ -1002,7 +1008,7 @@ export default function App() {
             <span className="text-purple-400">
               🔌 Eingespeist: {exportedKWh.toFixed(1)} kWh
             </span>
-            {settings && settings.export_limit_percent < 100 && (
+            {limitActive && (
               <span className="text-red-400">
                 🛑 Über Limit: {exportedExcessKWh.toFixed(1)} kWh
               </span>
@@ -1033,7 +1039,6 @@ export default function App() {
                 />
                 <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
                 {exportLimitWatts != null &&
-                  settings!.export_limit_percent > 0 &&
                   !hiddenLines.has("pv_power") && (
                     <ReferenceLine
                       y={exportLimitWatts}
@@ -1049,7 +1054,6 @@ export default function App() {
                     />
                   )}
                 {exportLimitWatts != null &&
-                  settings!.export_limit_percent > 0 &&
                   !hiddenLines.has("grid_power") && (
                     <ReferenceLine
                       y={-exportLimitWatts}
@@ -1251,7 +1255,9 @@ export default function App() {
                         Einspeisebegrenzung
                       </label>
                       <span className="text-sm font-semibold text-sky-400">
-                        {settingsForm.export_limit_percent} %
+                        {settingsForm.export_limit_percent === 0
+                          ? "Kein Limit"
+                          : `${settingsForm.export_limit_percent} %`}
                       </span>
                     </div>
                     <input
@@ -1269,7 +1275,7 @@ export default function App() {
                       className="w-full accent-sky-500"
                     />
                     <div className="flex justify-between text-xs text-slate-500">
-                      <span>0 %</span>
+                      <span>0 % = kein Limit</span>
                       <span>100 %</span>
                     </div>
                   </div>
