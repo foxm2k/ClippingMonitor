@@ -39,6 +39,53 @@ export interface TimeRange {
   end: string;
 }
 
+export type HealthLevel = "ok" | "warn" | "crit";
+export type BatterySource = "components" | "solar_api" | "unavailable";
+
+export interface BatteryHealth {
+  timestamp: string;
+  source: BatterySource;
+  battery_mode: string | null;
+  battery_standby: boolean | null;
+  backup_mode: boolean | null;
+  soc: number | null;
+  soh: number | null;
+  temp_cell: number | null;
+  temp_cell_min: number | null;
+  temp_cell_max: number | null;
+  temp_ambient: number | null;
+  temp_limit_min: number | null;
+  temp_limit_max: number | null;
+  voltage_dc: number | null;
+  current_dc: number | null;
+  cell_state: number | null;
+  status_bms: number | null;
+  status_battery: number | null;
+  stack_state_flags: number | null;
+  cell_voltage_min: number | null;
+  cell_voltage_max: number | null;
+  cell_spread_mv: number | null;
+  module_count: number | null;
+  capacity_wh: number | null;
+  lifetime_charged_kwh: number | null;
+  lifetime_discharged_kwh: number | null;
+  cycles: number | null;
+  inverter_state: string | null;
+  inverter_status_code: number | null;
+  inverter_error_code: number | null;
+  levels: { temp: HealthLevel; soh: HealthLevel; spread: HealthLevel };
+}
+
+export interface BatteryEvent {
+  id: string;
+  created: string;
+  category: string;
+  severity: "info" | "warn" | "crit";
+  message: string;
+  old_value: string;
+  new_value: string;
+}
+
 export function getTimeRange(filter: "24h" | "today" | "yesterday" | "tomorrow"): TimeRange {
   const now = new Date();
 
@@ -95,6 +142,16 @@ export async function fetchForecast(): Promise<ForecastPoint[]> {
 
 export async function setChargeLimit(limitPct: number): Promise<void> {
   await api.post("/api/battery/charge_limit", { limit_pct: limitPct });
+}
+
+export async function fetchBatteryHealth(): Promise<BatteryHealth> {
+  const response = await api.get<BatteryHealth>("/api/battery/health");
+  return response.data;
+}
+
+export async function fetchBatteryEvents(limit: number): Promise<BatteryEvent[]> {
+  const response = await api.get<BatteryEvent[]>(`/api/battery/events?limit=${limit}&_t=${Date.now()}`);
+  return response.data;
 }
 
 export default api;
