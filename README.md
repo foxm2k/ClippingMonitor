@@ -78,7 +78,8 @@ Zum Wechselrichter gehen zwei Kanäle: Modbus TCP für das Lesen und Schreiben d
 │   ├── battery_health.py       # Batterie-Zustand, Warnstufen, Ereignisse
 │   ├── modbus_service.py       # Modbus-TCP-Client (SunSpec)
 │   ├── config/
-│   │   └── settings.json       # Persistierte Einstellungen
+│   │   ├── settings.example.json  # Vorlage (settings.json selbst ist nicht im Repo)
+│   │   └── settings.json       # Persistierte Einstellungen (lokal)
 │   ├── tests/                  # pytest (Batterie-Zustand, Auto-Control) inkl. WR-Fixtures
 │   ├── requirements.txt        # Laufzeit-Abhängigkeiten
 │   ├── requirements-dev.txt    # + pytest
@@ -203,6 +204,8 @@ Nach neuen Migrationen: Stack in Portainer mit **Pull and redeploy** neu bauen. 
 ## Konfiguration (Settings)
 
 Alle Einstellungen sind über das Settings-Tab im Dashboard konfigurierbar und werden in `backend/config/settings.json` persistiert (im Docker-Betrieb `/app/config/settings.json`, auf den Host gemountet). Fehlt die Datei, legt das Backend sie mit den Defaults an.
+
+`settings.json` enthält Standort und Anlagendaten und ist deshalb nicht im Repo (`.gitignore`). Als Vorlage dient `backend/config/settings.example.json`.
 
 | Einstellung | Beschreibung | Default |
 |---|---|---|

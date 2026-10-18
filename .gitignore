@@ -32,3 +32,6 @@ database/pocketbase.exe
 
 # Claude Code
 .claude/
+
+# Lokale Einstellungen (Standort, Anlagendaten)
+backend/config/settings.json
