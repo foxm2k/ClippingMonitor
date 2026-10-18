@@ -3,6 +3,7 @@ import asyncio
 import datetime
 import json
 import logging
+from urllib.parse import urlsplit
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -36,7 +37,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 FRONIUS_URL = os.getenv("FRONIUS_URL", "http://192.168.123.79/solar_api/v1/GetPowerFlowRealtimeData.fcgi")
-FRONIUS_BASE_URL = os.getenv("FRONIUS_BASE_URL", "http://192.168.123.79")
+_fronius_url_parts = urlsplit(FRONIUS_URL)
+FRONIUS_BASE_URL = os.getenv(
+    "FRONIUS_BASE_URL", f"{_fronius_url_parts.scheme}://{_fronius_url_parts.netloc}"
+)
 POCKETBASE_URL = os.getenv("POCKETBASE_URL", "http://127.0.0.1:8090")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 POLL_INTERVAL = 60  # Sekunden
@@ -107,6 +111,11 @@ _battery_status_cache: dict | None = None
 _battery_health_cache: dict | None = None
 battery_event_detector = BatteryEventDetector()
 battery_persist_throttle = PersistThrottle()
+# Noch nicht in PocketBase gespeicherte Ereignisse (bleiben bei DB-Ausfall erhalten)
+_pending_battery_events: list[dict] = []
+PENDING_BATTERY_EVENTS_MAX = 100
+# Ziele, deren PocketBase-Schreibzugriff gerade fehlschlaegt (Log-Rauschen vermeiden)
+_battery_pb_failing: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # SSE Broadcaster – eine asyncio.Queue pro verbundenem Client
@@ -127,11 +136,28 @@ async def broadcast_event(payload: dict) -> None:
         _sse_clients.remove(q)
 
 
+def _note_battery_pb_failure(target: str, error: Exception) -> None:
+    """Erster Fehler eines Ausfalls als WARNING, danach nur DEBUG."""
+    first_line = (str(error).splitlines() or [""])[0][:120]
+    level = logging.DEBUG if target in _battery_pb_failing else logging.WARNING
+    _battery_pb_failing.add(target)
+    logger.log(
+        level, "%s konnte nicht gespeichert werden (%s: %s)",
+        target, type(error).__name__, first_line,
+    )
+
+
+def _note_battery_pb_success(target: str) -> None:
+    if target in _battery_pb_failing:
+        _battery_pb_failing.discard(target)
+        logger.info("%s wieder gespeichert", target)
+
+
 async def _process_battery_health(powerflow_raw: dict) -> None:
     """Batterie-Zustand holen, an Clients senden, Ereignisse sofort und
     Messwerte gedrosselt (alle 5 min) in PocketBase speichern."""
     global _battery_health_cache
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
         snapshot = await fetch_battery_health(client, FRONIUS_BASE_URL, powerflow_raw)
 
     events = battery_event_detector.process(snapshot)
@@ -140,19 +166,46 @@ async def _process_battery_health(powerflow_raw: dict) -> None:
     await broadcast_event({"type": "battery_health", "data": snapshot})
 
     pb = PocketBase(POCKETBASE_URL)
+
+    # Ereignisse: Detektor-Zustand ist schon weitergeschaltet, daher bei
+    # Schreibfehlern puffern und im naechsten Zyklus in Reihenfolge nachholen.
     for ev in events:
         logger.info("Batterie-Ereignis [%s] %s", ev.severity, ev.message)
-        await asyncio.to_thread(pb.collection("battery_events").create, asdict(ev))
-    if events:
+        _pending_battery_events.append(asdict(ev))
+    overflow = len(_pending_battery_events) - PENDING_BATTERY_EVENTS_MAX
+    if overflow > 0:
+        logger.warning(
+            "Ereignis-Puffer voll – verwerfe %d aelteste(s) Batterie-Ereignis(se)", overflow
+        )
+        del _pending_battery_events[:overflow]
+
+    written = 0
+    while _pending_battery_events:
+        try:
+            await asyncio.to_thread(
+                pb.collection("battery_events").create, _pending_battery_events[0]
+            )
+        except Exception as e:
+            _note_battery_pb_failure("Batterie-Ereignis", e)
+            break
+        _pending_battery_events.pop(0)
+        written += 1
+        _note_battery_pb_success("Batterie-Ereignis")
+    if written:
         await broadcast_event({"type": "battery_event"})
 
     now = datetime.datetime.now(datetime.timezone.utc)
     if battery_persist_throttle.due(now):
-        await asyncio.to_thread(
-            pb.collection("battery_health_logs").create, db_record(snapshot)
-        )
-        battery_persist_throttle.mark(now)
-        logger.info("Batterie-Zustand gespeichert (Quelle: %s)", snapshot["source"])
+        try:
+            await asyncio.to_thread(
+                pb.collection("battery_health_logs").create, db_record(snapshot)
+            )
+        except Exception as e:
+            _note_battery_pb_failure("Batterie-Zustand", e)
+        else:
+            battery_persist_throttle.mark(now)
+            _note_battery_pb_success("Batterie-Zustand")
+            logger.info("Batterie-Zustand gespeichert (Quelle: %s)", snapshot["source"])
 
 
 async def poll_and_store_data():
@@ -185,12 +238,6 @@ async def poll_and_store_data():
             }
             await broadcast_event({"type": "live", "data": live_record})
             await broadcast_event({"type": "chart"})
-
-            # Batterie-Zustand – eigener Fehlerkontext, damit Auto-Control weiterlaeuft
-            try:
-                await _process_battery_health(raw_data)
-            except Exception:
-                logger.exception("Fehler beim Verarbeiten des Batterie-Zustands")
 
             # Auto-Control prüfen
             battery_changed = False
@@ -259,6 +306,12 @@ async def poll_and_store_data():
                         await broadcast_event({"type": "battery", "data": batt_result})
                 except Exception:
                     logger.exception("Fehler beim SSE-Broadcast des Batterie-Status")
+
+            # Batterie-Zustand – bewusst nach Auto-Control, eigener Fehlerkontext
+            try:
+                await _process_battery_health(raw_data)
+            except Exception:
+                logger.exception("Fehler beim Verarbeiten des Batterie-Zustands")
 
         except httpx.ConnectError:
             logger.warning("Wechselrichter nicht erreichbar – überspringe Zyklus")
@@ -512,7 +565,7 @@ async def get_battery_events(limit: int = Query(default=50, ge=1, le=200)):
         pb = PocketBase(POCKETBASE_URL)
         result = await asyncio.to_thread(
             pb.collection("battery_events").get_list,
-            1, limit, {"sort": "-created"},
+            1, limit, {"sort": "-created", "skipTotal": 1},
         )
         return [
             {
