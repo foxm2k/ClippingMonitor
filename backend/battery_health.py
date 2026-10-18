@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -18,8 +19,10 @@ TEMP_CRIT_LOW = 0.0
 TEMP_CRIT_HIGH = 50.0
 TEMP_HYSTERESIS = 1.0  # K – verhindert Flattern der Ereignisse an der Schwelle
 SOH_WARN = 80.0
+SOH_HYSTERESIS = 0.5  # Prozentpunkte
 SPREAD_WARN_MV = 50.0
 SPREAD_CRIT_MV = 100.0
+SPREAD_HYSTERESIS_MV = 5.0
 
 LEVELS = ("ok", "warn", "crit")
 
@@ -59,16 +62,38 @@ INVERTER_KEYS = ("inverter_state", "inverter_status_code", "inverter_error_code"
 DB_FIELDS = ("source",) + POWERFLOW_KEYS + HEALTH_KEYS + INVERTER_KEYS
 
 
-def _round(value, digits: int) -> float | None:
-    return None if value is None else round(float(value), digits)
+def _num(value: object) -> float | None:
+    """Zahl oder None – nie eine Exception (undokumentierte API, Firmware-Drift)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
-def _int(value) -> int | None:
-    return None if value is None else int(value)
+def _round(value: object, digits: int) -> float | None:
+    number = _num(value)
+    return None if number is None else round(number, digits)
+
+
+def _int(value: object) -> int | None:
+    number = _num(value)
+    return None if number is None else int(number)
 
 
 def _empty(keys: tuple[str, ...]) -> dict:
     return dict.fromkeys(keys)
+
+
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _body_data(raw: object) -> dict:
+    """raw['Body']['Data'] oder {} – egal wie kaputt die Antwort ist."""
+    return _dict(_dict(_dict(raw).get("Body")).get("Data"))
 
 
 def _active_components(data: dict, device_class: str) -> list[dict]:
@@ -79,24 +104,30 @@ def _active_components(data: dict, device_class: str) -> list[dict]:
     """
     result = []
     for comp in data.values():
-        attrs = comp.get("attributes") or {}
+        if not isinstance(comp, dict):
+            continue
+        attrs = _dict(comp.get("attributes"))
         if attrs.get("device-class") != device_class:
             continue
-        if attrs.get("[ENABLE]") != "true" or not comp.get("channels"):
+        enabled = str(attrs.get("[ENABLE]")).lower() == "true"
+        if not enabled or not isinstance(comp.get("channels"), dict) or not comp["channels"]:
             continue
         result.append(comp)
     return result
 
 
-def _parse_nameplate(raw: str | None) -> dict:
-    """Das Typenschild steckt als JSON-String im Attribut 'nameplate'."""
-    if not raw:
+def _parse_nameplate(raw: object) -> dict:
+    """Das Typenschild steckt als JSON-String (oder schon als dict) im Attribut 'nameplate'."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw or not isinstance(raw, (str, bytes)):
         return {}
     try:
-        return json.loads(raw)
-    except ValueError:
+        result = json.loads(raw)
+    except (TypeError, ValueError):
         logger.warning("Batterie-Typenschild nicht lesbar: %r", raw[:80])
         return {}
+    return result if isinstance(result, dict) else {}
 
 
 def parse_components(raw: dict) -> dict:
@@ -105,43 +136,41 @@ def parse_components(raw: dict) -> dict:
     Komponenten werden ueber ihre device-class gefunden, nicht ueber die
     Device-ID (enthaelt Hashes, die sich z. B. nach Modultausch aendern).
     """
-    data = raw.get("Body", {}).get("Data", {})
+    data = _body_data(raw)
     storages = _active_components(data, "Storage")
     if not storages:
         raise ValueError("Keine aktive Storage-Komponente gefunden")
     storage = storages[0]["channels"]
-    nameplate = _parse_nameplate(storages[0]["attributes"].get("nameplate"))
+    nameplate = _parse_nameplate(_dict(storages[0].get("attributes")).get("nameplate"))
 
     stacks = _active_components(data, "BatteryStack")
     stack = stacks[0]["channels"] if stacks else {}
     modules = [m["channels"] for m in _active_components(data, "BatteryModule")]
 
     cell_mins = [
-        m["BATMODULE_VOLTAGE_CELL_MIN_F32"]
-        for m in modules
-        if m.get("BATMODULE_VOLTAGE_CELL_MIN_F32") is not None
+        v for v in (_num(m.get("BATMODULE_VOLTAGE_CELL_MIN_F32")) for m in modules)
+        if v is not None
     ]
     cell_maxs = [
-        m["BATMODULE_VOLTAGE_CELL_MAX_F32"]
-        for m in modules
-        if m.get("BATMODULE_VOLTAGE_CELL_MAX_F32") is not None
+        v for v in (_num(m.get("BATMODULE_VOLTAGE_CELL_MAX_F32")) for m in modules)
+        if v is not None
     ]
     cell_min = min(cell_mins) if cell_mins else None
     cell_max = max(cell_maxs) if cell_maxs else None
 
-    capacity_wh = nameplate.get("capacity_wh")
-    charged_ws = storage.get("BAT_ENERGYACTIVE_LIFETIME_CHARGED_F64")
-    discharged_ws = storage.get("BAT_ENERGYACTIVE_LIFETIME_DISCHARGED_F64")
+    capacity_wh = _num(nameplate.get("capacity_wh"))
+    charged_ws = _num(storage.get("BAT_ENERGYACTIVE_LIFETIME_CHARGED_F64"))
+    discharged_ws = _num(storage.get("BAT_ENERGYACTIVE_LIFETIME_DISCHARGED_F64"))
+
+    # Stack liefert SoH mit Nachkommastelle, Storage nur ganzzahlig
+    soh = _num(stack.get("BATSTACK_PERCENT_SOH_F32"))
+    if soh is None:
+        soh = _num(storage.get("BAT_VALUE_STATE_OF_HEALTH_RELATIVE_U16"))
 
     result = _empty(HEALTH_KEYS)
     result.update({
         "soc": _round(storage.get("BAT_VALUE_STATE_OF_CHARGE_RELATIVE_F32"), 1),
-        # Stack liefert SoH mit Nachkommastelle, Storage nur ganzzahlig
-        "soh": _round(
-            stack.get("BATSTACK_PERCENT_SOH_F32",
-                      storage.get("BAT_VALUE_STATE_OF_HEALTH_RELATIVE_U16")),
-            1,
-        ),
+        "soh": _round(soh, 1),
         "temp_cell": _round(storage.get("BAT_TEMPERATURE_CELL_F64"), 1),
         "temp_cell_min": _round(storage.get("BAT_TEMPERATURE_CELL_MIN_F64"), 1),
         "temp_cell_max": _round(storage.get("BAT_TEMPERATURE_CELL_MAX_F64"), 1),
@@ -184,10 +213,12 @@ def parse_storage_realtime(raw: dict) -> dict:
     Liefert weniger Werte. SoH bleibt leer, weil Capacity_Maximum dort
     immer der Nennkapazitaet entspricht und 100 % vortaeuschen wuerde.
     """
-    data = raw.get("Body", {}).get("Data", {})
+    data = _body_data(raw)
     if not data:
         raise ValueError("Keine Speicherdaten in der Solar API")
-    ctrl = next(iter(data.values()))["Controller"]
+    ctrl = _dict(_dict(next(iter(data.values()))).get("Controller"))
+    if not ctrl:
+        raise ValueError("Speicherdaten ohne Controller-Block")
 
     result = _empty(HEALTH_KEYS)
     result.update({
@@ -196,16 +227,16 @@ def parse_storage_realtime(raw: dict) -> dict:
         "voltage_dc": _round(ctrl.get("Voltage_DC"), 1),
         "current_dc": _round(ctrl.get("Current_DC"), 2),
         "cell_state": _int(ctrl.get("Status_BatteryCell")),
-        "capacity_wh": ctrl.get("DesignedCapacity"),
+        "capacity_wh": _num(ctrl.get("DesignedCapacity")),
     })
     return result
 
 
 def parse_powerflow_battery(raw: dict) -> dict:
     """Batterie-Zustandsfelder aus GetPowerFlowRealtimeData."""
-    data = raw.get("Body", {}).get("Data", {})
-    site = data.get("Site", {})
-    inverter = (data.get("Inverters") or {}).get("1", {})
+    data = _body_data(raw)
+    site = _dict(data.get("Site"))
+    inverter = _dict(_dict(data.get("Inverters")).get("1"))
     return {
         "battery_mode": inverter.get("Battery_Mode"),
         "battery_standby": site.get("BatteryStandby"),
@@ -215,10 +246,12 @@ def parse_powerflow_battery(raw: dict) -> dict:
 
 def parse_inverter_info(raw: dict) -> dict:
     """WR-Betriebszustand aus GetInverterInfo."""
-    data = raw.get("Body", {}).get("Data", {})
+    data = _body_data(raw)
     if not data:
         raise ValueError("Keine Wechselrichter-Info")
-    inv = next(iter(data.values()))
+    inv = _dict(next(iter(data.values())))
+    if not inv:
+        raise ValueError("Leerer Wechselrichter-Eintrag")
     return {
         "inverter_state": inv.get("InverterState"),
         "inverter_status_code": _int(inv.get("StatusCode")),
@@ -249,20 +282,31 @@ def temp_level(temp: float | None, prev: str = "ok") -> str | None:
     return level
 
 
-def soh_level(soh: float | None) -> str | None:
+def soh_level(soh: float | None, prev: str = "ok") -> str | None:
     if soh is None:
         return None
-    return "warn" if soh < SOH_WARN else "ok"
+    if soh < SOH_WARN:
+        return "warn"
+    if prev != "ok" and soh < SOH_WARN + SOH_HYSTERESIS:
+        return "warn"  # Verbesserung erst mit Abstand zur Schwelle
+    return "ok"
 
 
-def spread_level(spread_mv: float | None) -> str | None:
-    if spread_mv is None:
-        return None
-    if spread_mv >= SPREAD_CRIT_MV:
+def _spread_raw_level(spread_mv: float, margin: float) -> str:
+    if spread_mv >= SPREAD_CRIT_MV - margin:
         return "crit"
-    if spread_mv >= SPREAD_WARN_MV:
+    if spread_mv >= SPREAD_WARN_MV - margin:
         return "warn"
     return "ok"
+
+
+def spread_level(spread_mv: float | None, prev: str = "ok") -> str | None:
+    if spread_mv is None:
+        return None
+    level = _spread_raw_level(spread_mv, 0.0)
+    if LEVELS.index(level) < LEVELS.index(prev):
+        level = _spread_raw_level(spread_mv, SPREAD_HYSTERESIS_MV)
+    return level
 
 
 LEVEL_TEXT = {
@@ -278,7 +322,7 @@ SOURCE_TEXT = {
 SOURCE_SEVERITY = {"components": "info", "solar_api": "warn", "unavailable": "crit"}
 
 
-@dataclass
+@dataclass(frozen=True)
 class BatteryEvent:
     category: str   # mode|standby|backup|cell_state|inverter|error|source|temperature|soh|cell_spread
     severity: str   # info|warn|crit
@@ -287,33 +331,33 @@ class BatteryEvent:
     new_value: str
 
 
-def _describe_mode(old, new):
+def _describe_mode(old: object, new: object) -> tuple[str, str]:
     return ("info" if new == "normal" else "warn"), f"Batteriemodus: {old} → {new}"
 
 
-def _describe_standby(old, new):
+def _describe_standby(old: object, new: object) -> tuple[str, str]:
     return "info", ("Batterie in Standby" if new else "Batterie aus Standby aufgewacht")
 
 
-def _describe_backup(old, new):
+def _describe_backup(old: object, new: object) -> tuple[str, str]:
     return ("warn", "Notstrombetrieb aktiv") if new else ("info", "Notstrombetrieb beendet")
 
 
-def _describe_cell_state(old, new):
+def _describe_cell_state(old: object, new: object) -> tuple[str, str]:
     return "info", f"Zellstatus: {old} → {new}"
 
 
-def _describe_inverter(old, new):
+def _describe_inverter(old: object, new: object) -> tuple[str, str]:
     return ("info" if new == "Running" else "warn"), f"Wechselrichter: {old} → {new}"
 
 
-def _describe_error(old, new):
+def _describe_error(old: object, new: object) -> tuple[str, str]:
     if new == 0:
         return "info", f"WR-Fehlercode {old} behoben"
     return "crit", f"WR-Fehlercode {new}"
 
 
-def _describe_source(old, new):
+def _describe_source(old: object, new: object) -> tuple[str, str]:
     return SOURCE_SEVERITY[new], f"Datenquelle: {SOURCE_TEXT[old]} → {SOURCE_TEXT[new]}"
 
 
@@ -329,6 +373,12 @@ _CHANGE_RULES = (
 )
 
 
+def _event_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "ja" if value else "nein"
+    return str(value)
+
+
 def _fmt_temp(snap: dict) -> str:
     lo, hi = snap.get("temp_cell_min"), snap.get("temp_cell_max")
     if lo is not None and hi is not None:
@@ -338,10 +388,19 @@ def _fmt_temp(snap: dict) -> str:
 
 
 class BatteryEventDetector:
-    """Vergleicht aufeinanderfolgende Snapshots und erzeugt Ereignisse."""
+    """Vergleicht aufeinanderfolgende Snapshots und erzeugt Ereignisse.
+
+    Pro Feld wird der zuletzt bekannte Wert gemerkt; ein fehlender Wert (None)
+    ueberschreibt ihn nicht. So geht ein Wechsel A -> (Aussetzer) -> B nicht
+    verloren.
+
+    Nach einem Neustart ist der erste Snapshot die Basis: Aenderungen waehrend
+    der Ausfallzeit werden nicht nachgetragen, bereits bestehende Level ausser
+    "ok" werden dagegen erneut gemeldet.
+    """
 
     def __init__(self):
-        self._prev: dict | None = None
+        self._last: dict = {}
         self._levels = {"temp": "ok", "soh": "ok", "spread": "ok"}
 
     def levels(self) -> dict:
@@ -349,15 +408,18 @@ class BatteryEventDetector:
 
     def process(self, snap: dict) -> list[BatteryEvent]:
         events: list[BatteryEvent] = []
-        if self._prev is not None:
-            for key, category, describe in _CHANGE_RULES:
-                old, new = self._prev.get(key), snap.get(key)
-                if old is None or new is None or old == new:
-                    continue
+        for key, category, describe in _CHANGE_RULES:
+            new = snap.get(key)
+            if new is None:
+                continue
+            old = self._last.get(key)
+            if old is not None and old != new:
                 severity, message = describe(old, new)
-                events.append(BatteryEvent(category, severity, message, str(old), str(new)))
+                events.append(BatteryEvent(
+                    category, severity, message, _event_value(old), _event_value(new)
+                ))
+            self._last[key] = new
         events.extend(self._update_levels(snap))
-        self._prev = snap
         return events
 
     def _temp_level(self, snap: dict) -> str | None:
@@ -373,9 +435,10 @@ class BatteryEventDetector:
         checks = (
             ("temp", "temperature", self._temp_level(snap),
              lambda: f"Zelltemperatur {_fmt_temp(snap)}"),
-            ("soh", "soh", soh_level(snap.get("soh")),
+            ("soh", "soh", soh_level(snap.get("soh"), self._levels["soh"]),
              lambda: f"State of Health {snap['soh']:.1f} %"),
-            ("spread", "cell_spread", spread_level(snap.get("cell_spread_mv")),
+            ("spread", "cell_spread",
+             spread_level(snap.get("cell_spread_mv"), self._levels["spread"]),
              lambda: f"Zellspannungs-Differenz {snap['cell_spread_mv']:.0f} mV"),
         )
         events = []
@@ -415,6 +478,22 @@ def db_record(snapshot: dict) -> dict:
     return {k: snapshot[k] for k in DB_FIELDS if snapshot.get(k) is not None}
 
 
+# Abrufziele, die aktuell fehlschlagen – damit ein Dauerfehler nur einmal
+# als WARNING auftaucht und danach auf DEBUG bleibt.
+_failing: set[str] = set()
+
+
+def _note_failure(target: str, error: Exception, hint: str = "") -> None:
+    text = f"{type(error).__name__}: {str(error)[:120]}"
+    level = logging.DEBUG if target in _failing else logging.WARNING
+    _failing.add(target)
+    logger.log(level, "%s nicht nutzbar (%s)%s", target, text, hint)
+
+
+def _note_success(target: str) -> None:
+    _failing.discard(target)
+
+
 async def _get_json(client: httpx.AsyncClient, url: str) -> dict:
     response = await client.get(url)
     response.raise_for_status()
@@ -434,24 +513,33 @@ async def fetch_battery_health(
     try:
         health = parse_components(await _get_json(client, base_url + COMPONENTS_PATH))
         source = "components"
+        _note_success("Komponenten-API")
     except Exception as e:
-        logger.warning("Komponenten-API nicht nutzbar (%s) – versuche Solar API", e)
+        _note_failure("Komponenten-API", e, " – versuche Solar API")
         try:
             health = parse_storage_realtime(await _get_json(client, base_url + STORAGE_PATH))
             source = "solar_api"
+            _note_success("Solar-API-Speicherdaten")
         except Exception as e2:
-            logger.warning("Speicherdaten der Solar API nicht verfuegbar: %s", e2)
+            _note_failure("Solar-API-Speicherdaten", e2)
 
     inverter = _empty(INVERTER_KEYS)
     try:
         inverter = parse_inverter_info(await _get_json(client, base_url + INVERTER_INFO_PATH))
+        _note_success("WR-Info")
     except Exception as e:
-        logger.warning("Wechselrichter-Info nicht verfuegbar: %s", e)
+        _note_failure("WR-Info", e)
+
+    try:
+        powerflow = parse_powerflow_battery(powerflow_raw)
+    except Exception as e:
+        _note_failure("PowerFlow-Batteriefelder", e)
+        powerflow = _empty(POWERFLOW_KEYS)
 
     return {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         "source": source,
-        **parse_powerflow_battery(powerflow_raw),
+        **powerflow,
         **health,
         **inverter,
     }
