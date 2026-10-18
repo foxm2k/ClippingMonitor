@@ -12,6 +12,18 @@ const LEVEL_COLOR: Record<HealthLevel, string> = {
   crit: "text-red-400",
 };
 
+const LEVEL_LABEL: Record<HealthLevel, string> = {
+  ok: "",
+  warn: "Warnung",
+  crit: "Kritisch",
+};
+
+const SEVERITY_LABEL: Record<BatteryEvent["severity"], string> = {
+  info: "Info",
+  warn: "Warnung",
+  crit: "Kritisch",
+};
+
 const SEVERITY_BORDER: Record<BatteryEvent["severity"], string> = {
   info: "border-l-slate-500",
   warn: "border-l-amber-400",
@@ -47,21 +59,45 @@ function fmt(value: number | null, digits: number, unit: string): string {
   return value == null ? "–" : `${value.toFixed(digits)} ${unit}`;
 }
 
+// Farbe nur bei vorhandenem Wert; die Stufe zusätzlich als Text (nicht nur Farbe)
+function levelStyle(value: number | null, level: HealthLevel) {
+  if (value == null) return { valueClass: "text-slate-500", levelNote: undefined };
+  return {
+    valueClass: LEVEL_COLOR[level] ?? "text-white",
+    levelNote: level === "ok" ? undefined : LEVEL_LABEL[level],
+  };
+}
+
+// Uhrzeit, bei anderem Kalendertag (in der Anzeige-Zeitzone) zusätzlich Tag und Monat
+function formatUpdated(iso: string, nowMs: number, timezone: string): string {
+  const date = new Date(iso);
+  const day = (d: Date) => d.toLocaleDateString("de-AT", { timeZone: timezone });
+  const time = date.toLocaleTimeString("de-AT", { hour: "2-digit", minute: "2-digit", timeZone: timezone });
+  if (day(date) === day(new Date(nowMs))) return time;
+  const dm = date.toLocaleDateString("de-AT", { day: "2-digit", month: "2-digit", timeZone: timezone });
+  return `${dm}, ${time}`;
+}
+
 function Tile({
   label,
   value,
   valueClass = "text-white",
+  levelNote,
   children,
 }: {
   label: string;
   value: ReactNode;
   valueClass?: string;
+  levelNote?: string;
   children?: ReactNode;
 }) {
   return (
     <div className="rounded-xl bg-slate-700/50 p-4">
       <div className="text-xs text-slate-400 mb-1">{label}</div>
-      <div className={`text-lg font-semibold ${valueClass}`}>{value}</div>
+      <div className={`text-lg font-semibold ${valueClass}`}>
+        <span className={levelNote ? "whitespace-nowrap" : undefined}>{value}</span>
+        {levelNote && <span className="ml-2 inline-block text-xs font-medium">{levelNote}</span>}
+      </div>
       {children && <div className="text-xs text-slate-400 mt-1 space-y-0.5">{children}</div>}
     </div>
   );
@@ -81,11 +117,11 @@ export function BatteryHealthCard({ health, timezone }: { health: BatteryHealth;
       : null;
   const current = health.current_dc;
   const currentHint = current == null || current === 0 ? "" : current > 0 ? " (lädt)" : " (entlädt)";
-  const updated = new Date(health.timestamp).toLocaleTimeString("de-AT", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: timezone,
-  });
+  const updated = formatUpdated(health.timestamp, now, timezone);
+  const sourceLabel = SOURCE_LABEL[health.source] ?? health.source;
+  const temp = levelStyle(health.temp_cell, health.levels.temp);
+  const soh = levelStyle(health.soh, health.levels.soh);
+  const spread = levelStyle(health.cell_spread_mv, health.levels.spread);
   const stale = now - Date.parse(health.timestamp) > STALE_AFTER_MS;
 
   return (
@@ -106,7 +142,7 @@ export function BatteryHealthCard({ health, timezone }: { health: BatteryHealth;
 
       {health.source !== "components" && (
         <div className="mb-4 rounded-lg bg-amber-400/10 px-3 py-2 text-xs text-amber-300">
-          Datenquelle: {SOURCE_LABEL[health.source]} – nicht alle Werte verfügbar.
+          Datenquelle: {sourceLabel} – nicht alle Werte verfügbar.
         </div>
       )}
 
@@ -127,7 +163,7 @@ export function BatteryHealthCard({ health, timezone }: { health: BatteryHealth;
           {health.backup_mode && <div className="text-amber-300">Notstrom aktiv</div>}
         </Tile>
 
-        <Tile label="Zelltemperatur" value={fmt(health.temp_cell, 1, "°C")} valueClass={LEVEL_COLOR[health.levels.temp]}>
+        <Tile label="Zelltemperatur" value={fmt(health.temp_cell, 1, "°C")} valueClass={temp.valueClass} levelNote={temp.levelNote}>
           {health.temp_cell_min != null && health.temp_cell_max != null && (
             <div>
               min {health.temp_cell_min.toFixed(1)} / max {health.temp_cell_max.toFixed(1)} °C
@@ -141,14 +177,15 @@ export function BatteryHealthCard({ health, timezone }: { health: BatteryHealth;
           )}
         </Tile>
 
-        <Tile label="State of Health" value={fmt(health.soh, 1, "%")} valueClass={LEVEL_COLOR[health.levels.soh]}>
+        <Tile label="State of Health" value={fmt(health.soh, 1, "%")} valueClass={soh.valueClass} levelNote={soh.levelNote}>
           {usableKwh != null && <div>≈ {usableKwh.toFixed(1)} kWh Kapazität</div>}
         </Tile>
 
         <Tile
           label="Zellspannung Δ"
           value={fmt(health.cell_spread_mv, 0, "mV")}
-          valueClass={LEVEL_COLOR[health.levels.spread]}
+          valueClass={spread.valueClass}
+          levelNote={spread.levelNote}
         >
           {health.cell_voltage_min != null && health.cell_voltage_max != null && (
             <div>
@@ -187,7 +224,7 @@ export function BatteryHealthCard({ health, timezone }: { health: BatteryHealth;
           <span className="text-red-400">Fehlercode {health.inverter_error_code}</span>
         )}
         <span className="text-slate-600">|</span>
-        <span>Quelle: {SOURCE_LABEL[health.source]}</span>
+        <span>Quelle: {sourceLabel}</span>
       </div>
     </div>
   );
@@ -197,13 +234,16 @@ export function BatteryEventLog({ timezone, refreshTrigger }: { timezone: string
   const [events, setEvents] = useState<BatteryEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [limit, setLimit] = useState(50);
+  const [error, setError] = useState(false);
 
   const load = async (n: number) => {
     setLoading(true);
     try {
       setEvents(await fetchBatteryEvents(n));
+      setError(false);
     } catch (err) {
       console.error("Batterie-Ereignisse konnten nicht geladen werden:", err);
+      setError(true);
     } finally {
       setLoading(false);
     }
@@ -251,6 +291,7 @@ export function BatteryEventLog({ timezone, refreshTrigger }: { timezone: string
           Aktualisieren
         </button>
         <select
+          aria-label="Anzahl Einträge"
           value={limit}
           onChange={(e) => handleLimitChange(Number(e.target.value))}
           className="rounded-lg bg-slate-700 border border-slate-600 text-white px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-sky-500"
@@ -261,11 +302,17 @@ export function BatteryEventLog({ timezone, refreshTrigger }: { timezone: string
         </select>
       </div>
 
+      {error && (
+        <div className="mb-3 rounded-lg bg-amber-400/10 px-3 py-2 text-xs text-amber-300">
+          Ereignisse konnten nicht geladen werden.
+        </div>
+      )}
+
       <div className="max-h-96 overflow-y-auto space-y-2">
         {loading && events.length === 0 && (
           <p className="text-sm text-slate-400 py-4 text-center">Lade Ereignisse…</p>
         )}
-        {!loading && events.length === 0 && (
+        {!loading && !error && events.length === 0 && (
           <p className="text-sm text-slate-400 py-4 text-center">
             Noch keine Ereignisse – Einträge entstehen nur bei Zustandsänderungen.
           </p>
@@ -280,7 +327,10 @@ export function BatteryEventLog({ timezone, refreshTrigger }: { timezone: string
               <span className="text-slate-600">|</span>
               <span>{CATEGORY_LABEL[e.category] ?? e.category}</span>
             </div>
-            <div className={`text-sm ${SEVERITY_TEXT[e.severity] ?? "text-slate-300"}`}>{e.message}</div>
+            <div className={`text-sm ${SEVERITY_TEXT[e.severity] ?? "text-slate-300"}`}>
+              <span className="sr-only">{SEVERITY_LABEL[e.severity] ?? e.severity}: </span>
+              {e.message}
+            </div>
           </div>
         ))}
       </div>
