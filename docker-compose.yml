@@ -2,14 +2,15 @@ version: '3.8'
 
 services:
   pocketbase:
-    image: ghcr.io/muchobien/pocketbase:latest
+    # Eigenes Image: Migrationen aus dem Git-Repo werden ins Image kopiert
+    # (ein relativer Bind-Mount funktioniert unter Portainer nicht)
+    build:
+      context: ./database
     container_name: clipping_pocketbase
     restart: unless-stopped
     volumes:
       # Fester Pfad auf deinem Server für die bestehenden Windows-Daten
-      - /opt/clippingmonitor/pb_data:/pb_data 
-      # Migrationen kommen direkt aus dem Git-Repo
-      - ./database/pb_migrations:/pb_migrations
+      - /opt/clippingmonitor/pb_data:/pb_data
     command: serve --dir=/pb_data --migrationsDir=/pb_migrations --http=0.0.0.0:8090
     networks:
       - internal

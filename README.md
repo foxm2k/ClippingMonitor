@@ -94,18 +94,17 @@ PV Smart Control überwacht eine Photovoltaikanlage in Echtzeit, visualisiert Er
 ### PocketBase
 
 ```bash
+cd database
 ./pocketbase serve
 ```
 
-Collection `power_logs` anlegen mit folgenden Feldern:
+Die Collections (`power_logs`, `battery_health_logs`, `battery_events`) werden über die Migrationen in `database/pb_migrations` angelegt. PocketBase wendet neue Migrationen beim Start automatisch an.
 
-| Feld | Typ |
-|---|---|
-| `pv_power` | number |
-| `load_power` | number |
-| `grid_power` | number |
-| `battery_power` | number |
-| `battery_soc` | number |
+### Deployment (Docker / Portainer)
+
+Der PocketBase-Container wird aus `database/Dockerfile` gebaut, das die Migrationen ins Image kopiert. Ein Bind-Mount auf `./database/pb_migrations` funktioniert unter Portainer nicht, weil Portainer das Repo in sein eigenes Volume klont und der relative Pfad auf dem Host ins Leere zeigt.
+
+Nach neuen Migrationen: Stack in Portainer mit **Pull and redeploy** neu bauen. Die PocketBase-Version ist im Dockerfile fest eingetragen (`0.40.5`) und wird bewusst manuell angehoben.
 
 ### Backend
 
