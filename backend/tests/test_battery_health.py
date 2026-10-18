@@ -4,7 +4,9 @@ from pathlib import Path
 import pytest
 
 from battery_health import (
+    DB_FIELDS,
     HEALTH_KEYS,
+    BatteryEventDetector,
     parse_components,
     parse_inverter_info,
     parse_powerflow_battery,
@@ -140,3 +142,112 @@ def test_soh_level(soh, expected):
 ])
 def test_spread_level(mv, expected):
     assert spread_level(mv) == expected
+
+
+# ---------------------------------------------------------------------------
+# Ereignis-Erkennung
+# ---------------------------------------------------------------------------
+
+def snap(**overrides) -> dict:
+    base = dict.fromkeys(DB_FIELDS)
+    base.update(
+        source="components",
+        battery_mode="normal",
+        battery_standby=False,
+        backup_mode=False,
+        cell_state=3,
+        inverter_state="Running",
+        inverter_error_code=0,
+        temp_cell=20.0,
+        temp_cell_min=19.0,
+        temp_cell_max=21.0,
+        soh=99.7,
+        cell_spread_mv=9.0,
+    )
+    base.update(overrides)
+    return base
+
+
+def summary(events) -> list[tuple]:
+    return [(e.category, e.severity, e.old_value, e.new_value) for e in events]
+
+
+def test_first_snapshot_is_baseline():
+    d = BatteryEventDetector()
+    assert d.process(snap()) == []
+    assert d.levels() == {"temp": "ok", "soh": "ok", "spread": "ok"}
+
+
+def test_first_snapshot_reports_bad_levels():
+    events = BatteryEventDetector().process(snap(temp_cell_max=41.0))
+    assert summary(events) == [("temperature", "warn", "ok", "warn")]
+
+
+def test_mode_change_and_back():
+    d = BatteryEventDetector()
+    d.process(snap())
+    assert summary(d.process(snap(battery_mode="service"))) == [("mode", "warn", "normal", "service")]
+    assert summary(d.process(snap())) == [("mode", "info", "service", "normal")]
+
+
+def test_error_code_events():
+    d = BatteryEventDetector()
+    d.process(snap())
+    assert summary(d.process(snap(inverter_error_code=567))) == [("error", "crit", "0", "567")]
+    assert summary(d.process(snap())) == [("error", "info", "567", "0")]
+
+
+def test_standby_backup_inverter_cell_state():
+    d = BatteryEventDetector()
+    d.process(snap())
+    events = d.process(snap(
+        battery_standby=True, backup_mode=True, inverter_state="Sleeping", cell_state=4,
+    ))
+    assert sorted(summary(events)) == sorted([
+        ("standby", "info", "False", "True"),
+        ("backup", "warn", "False", "True"),
+        ("inverter", "warn", "Running", "Sleeping"),
+        ("cell_state", "info", "3", "4"),
+    ])
+    standby = next(e for e in events if e.category == "standby")
+    assert standby.message == "Batterie in Standby"
+
+
+def test_missing_values_create_no_events():
+    d = BatteryEventDetector()
+    d.process(snap(temp_cell_max=41.0))
+    events = d.process(snap(
+        battery_mode=None, cell_state=None, inverter_error_code=None,
+        temp_cell=None, temp_cell_min=None, temp_cell_max=None,
+        soh=None, cell_spread_mv=None,
+    ))
+    assert events == []
+    assert d.levels()["temp"] == "warn"  # Level bleibt stehen
+
+
+def test_source_change():
+    d = BatteryEventDetector()
+    d.process(snap())
+    assert summary(d.process(snap(source="solar_api"))) == [("source", "warn", "components", "solar_api")]
+    assert summary(d.process(snap(source="unavailable"))) == [("source", "crit", "solar_api", "unavailable")]
+
+
+def test_temperature_hysteresis_prevents_flapping():
+    d = BatteryEventDetector()
+    assert summary(d.process(snap(temp_cell_max=40.5))) == [("temperature", "warn", "ok", "warn")]
+    assert d.process(snap(temp_cell_max=39.5)) == []
+    assert summary(d.process(snap(temp_cell_max=38.9))) == [("temperature", "info", "warn", "ok")]
+
+
+def test_cold_cell_is_critical():
+    events = BatteryEventDetector().process(snap(temp_cell_min=-1.0))
+    assert summary(events) == [("temperature", "crit", "ok", "crit")]
+    assert events[0].message == "Zelltemperatur -1.0–21.0 °C: kritischer Bereich"
+
+
+def test_soh_and_spread_levels():
+    events = BatteryEventDetector().process(snap(soh=79.0, cell_spread_mv=120.0))
+    assert sorted(summary(events)) == sorted([
+        ("soh", "warn", "ok", "warn"),
+        ("cell_spread", "crit", "ok", "crit"),
+    ])

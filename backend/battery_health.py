@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -253,3 +254,134 @@ def spread_level(spread_mv: float | None) -> str | None:
     if spread_mv >= SPREAD_WARN_MV:
         return "warn"
     return "ok"
+
+
+LEVEL_TEXT = {
+    "ok": "wieder im Normalbereich",
+    "warn": "Warnbereich",
+    "crit": "kritischer Bereich",
+}
+SOURCE_TEXT = {
+    "components": "Komponenten-API",
+    "solar_api": "Solar API (eingeschraenkt)",
+    "unavailable": "nicht erreichbar",
+}
+SOURCE_SEVERITY = {"components": "info", "solar_api": "warn", "unavailable": "crit"}
+
+
+@dataclass
+class BatteryEvent:
+    category: str   # mode|standby|backup|cell_state|inverter|error|source|temperature|soh|cell_spread
+    severity: str   # info|warn|crit
+    message: str
+    old_value: str
+    new_value: str
+
+
+def _describe_mode(old, new):
+    return ("info" if new == "normal" else "warn"), f"Batteriemodus: {old} → {new}"
+
+
+def _describe_standby(old, new):
+    return "info", ("Batterie in Standby" if new else "Batterie aus Standby aufgewacht")
+
+
+def _describe_backup(old, new):
+    return ("warn", "Notstrombetrieb aktiv") if new else ("info", "Notstrombetrieb beendet")
+
+
+def _describe_cell_state(old, new):
+    return "info", f"Zellstatus: {old} → {new}"
+
+
+def _describe_inverter(old, new):
+    return ("info" if new == "Running" else "warn"), f"Wechselrichter: {old} → {new}"
+
+
+def _describe_error(old, new):
+    if new == 0:
+        return "info", f"WR-Fehlercode {old} behoben"
+    return "crit", f"WR-Fehlercode {new}"
+
+
+def _describe_source(old, new):
+    return SOURCE_SEVERITY[new], f"Datenquelle: {SOURCE_TEXT[old]} → {SOURCE_TEXT[new]}"
+
+
+# (Snapshot-Feld, Ereignis-Kategorie, Beschreibung)
+_CHANGE_RULES = (
+    ("battery_mode", "mode", _describe_mode),
+    ("battery_standby", "standby", _describe_standby),
+    ("backup_mode", "backup", _describe_backup),
+    ("cell_state", "cell_state", _describe_cell_state),
+    ("inverter_state", "inverter", _describe_inverter),
+    ("inverter_error_code", "error", _describe_error),
+    ("source", "source", _describe_source),
+)
+
+
+def _fmt_temp(snap: dict) -> str:
+    lo, hi = snap.get("temp_cell_min"), snap.get("temp_cell_max")
+    if lo is not None and hi is not None:
+        return f"{lo:.1f}–{hi:.1f} °C"
+    value = hi if hi is not None else lo if lo is not None else snap.get("temp_cell")
+    return f"{value:.1f} °C"
+
+
+class BatteryEventDetector:
+    """Vergleicht aufeinanderfolgende Snapshots und erzeugt Ereignisse."""
+
+    def __init__(self):
+        self._prev: dict | None = None
+        self._levels = {"temp": "ok", "soh": "ok", "spread": "ok"}
+
+    def levels(self) -> dict:
+        return dict(self._levels)
+
+    def process(self, snap: dict) -> list[BatteryEvent]:
+        events: list[BatteryEvent] = []
+        if self._prev is not None:
+            for key, category, describe in _CHANGE_RULES:
+                old, new = self._prev.get(key), snap.get(key)
+                if old is None or new is None or old == new:
+                    continue
+                severity, message = describe(old, new)
+                events.append(BatteryEvent(category, severity, message, str(old), str(new)))
+        events.extend(self._update_levels(snap))
+        self._prev = snap
+        return events
+
+    def _temp_level(self, snap: dict) -> str | None:
+        values = [v for v in (snap.get("temp_cell_min"), snap.get("temp_cell_max")) if v is not None]
+        if not values and snap.get("temp_cell") is not None:
+            values = [snap["temp_cell"]]
+        if not values:
+            return None
+        prev = self._levels["temp"]
+        return _worst(temp_level(v, prev) for v in values)
+
+    def _update_levels(self, snap: dict) -> list[BatteryEvent]:
+        checks = (
+            ("temp", "temperature", self._temp_level(snap),
+             lambda: f"Zelltemperatur {_fmt_temp(snap)}"),
+            ("soh", "soh", soh_level(snap.get("soh")),
+             lambda: f"State of Health {snap['soh']:.1f} %"),
+            ("spread", "cell_spread", spread_level(snap.get("cell_spread_mv")),
+             lambda: f"Zellspannungs-Differenz {snap['cell_spread_mv']:.0f} mV"),
+        )
+        events = []
+        for name, category, level, describe in checks:
+            if level is None:  # Wert fehlt → Level unveraendert lassen
+                continue
+            old = self._levels[name]
+            if level == old:
+                continue
+            self._levels[name] = level
+            events.append(BatteryEvent(
+                category=category,
+                severity="info" if level == "ok" else level,
+                message=f"{describe()}: {LEVEL_TEXT[level]}",
+                old_value=old,
+                new_value=level,
+            ))
+        return events
