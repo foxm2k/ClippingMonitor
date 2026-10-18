@@ -103,7 +103,7 @@ function StatCard({
 }
 
 
-type FilterMode = "24h" | "today" | "yesterday" | "tomorrow" | "sunwindow";
+type FilterMode = "24h" | "today" | "yesterday" | "tomorrow";
 
 interface ChartPoint {
   time: string;
@@ -590,6 +590,15 @@ export default function App() {
   const [health, setHealth] = useState<BatteryHealth | null>(null);
   const [batteryEventTrigger, setBatteryEventTrigger] = useState(0);
   const [activeFilter, setActiveFilter] = useState<FilterMode>("today");
+  // Sonnenfenster ist kein eigener Zeitraum, sondern beschneidet den gewählten Tag
+  // auf die Stunden mit erwarteter PV-Erzeugung. Standard: an.
+  const [sunWindow, setSunWindow] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("sunWindow") !== "false";
+    } catch {
+      return true;
+    }
+  });
   const [hiddenLines, setHiddenLines] = useState<Set<string>>(() => {
     try {
       const stored = localStorage.getItem("hiddenLines");
@@ -603,6 +612,7 @@ export default function App() {
   }, [hiddenLines]);
 
   const activeFilterRef = useRef<FilterMode>("today");
+  const sunWindowRef = useRef<boolean>(sunWindow);
   const forecastRef = useRef<ForecastPoint[]>([]);
 
   const [tab, setTab] = useState<"dashboard" | "settings">("dashboard");
@@ -623,31 +633,30 @@ export default function App() {
     }
   };
 
-  const loadChartData = async (filter: FilterMode, forecastData: ForecastPoint[]) => {
-    let range: TimeRange | undefined;
+  const loadChartData = async (
+    filter: FilterMode,
+    cropToSun: boolean,
+    forecastData: ForecastPoint[],
+  ) => {
+    let range: TimeRange = getTimeRange(filter);
 
-    if (filter === "sunwindow") {
-      const todayRange = getTimeRange("today");
-      const rangeStart = new Date(todayRange.start);
-      const rangeEnd = new Date(todayRange.end);
-      const todayForecast = forecastData.filter((f) => {
+    // "Letzte 24h" spannt zwei Tage – dort wird nicht auf das Sonnenfenster beschnitten
+    if (cropToSun && filter !== "24h") {
+      const rangeStart = new Date(range.start);
+      const rangeEnd = new Date(range.end);
+      const sunPoints = forecastData.filter((f) => {
         const fTime = new Date(f.time + "Z");
-        return fTime >= rangeStart && fTime <= rangeEnd;
+        return f.expected_kw > 0 && fTime >= rangeStart && fTime <= rangeEnd;
       });
-      const sunPoints = todayForecast.filter((f) => f.expected_kw > 0);
       if (sunPoints.length > 0) {
         const first = new Date(sunPoints[0].time + "Z");
         const last = new Date(sunPoints[sunPoints.length - 1].time + "Z");
         range = { start: first.toISOString(), end: last.toISOString() };
-      } else {
-        range = getTimeRange("today");
       }
-    } else {
-      range = getTimeRange(filter);
     }
 
     const histData = await fetchHistory(range);
-    setChartData(mergeChartData(histData, forecastData, range!));
+    setChartData(mergeChartData(histData, forecastData, range));
   };
 
   useEffect(() => {
@@ -665,7 +674,7 @@ export default function App() {
         setBattery(batteryResult.value.data);
       }
 
-      await loadChartData(activeFilterRef.current, forecastData);
+      await loadChartData(activeFilterRef.current, sunWindowRef.current, forecastData);
     };
 
     fetchSettings()
@@ -698,7 +707,7 @@ export default function App() {
         }
 
         if (payload.type === "chart") {
-          loadChartData(activeFilterRef.current, forecastRef.current).catch((err) =>
+          loadChartData(activeFilterRef.current, sunWindowRef.current, forecastRef.current).catch((err) =>
             console.error("SSE chart reload failed:", err)
           );
         }
@@ -727,7 +736,7 @@ export default function App() {
       try {
         const newForecast = await fetchForecast();
         forecastRef.current = newForecast;
-        loadChartData(activeFilterRef.current, forecastRef.current).catch(console.error);
+        loadChartData(activeFilterRef.current, sunWindowRef.current, forecastRef.current).catch(console.error);
       } catch (err) {
         console.error("Automatischer Forecast-Reload fehlgeschlagen:", err);
       }
@@ -753,7 +762,18 @@ export default function App() {
   const handleFilterChange = async (filter: FilterMode) => {
     activeFilterRef.current = filter;
     setActiveFilter(filter);
-    await loadChartData(filter, forecastRef.current);
+    await loadChartData(filter, sunWindowRef.current, forecastRef.current);
+  };
+
+  const handleSunWindowChange = async (value: boolean) => {
+    sunWindowRef.current = value;
+    setSunWindow(value);
+    try {
+      localStorage.setItem("sunWindow", String(value));
+    } catch {
+      // Speichern optional – Einstellung gilt dann nur für diese Sitzung
+    }
+    await loadChartData(activeFilterRef.current, value, forecastRef.current);
   };
 
   const handleToggleAutoMode = async (newValue: boolean) => {
@@ -887,29 +907,76 @@ export default function App() {
             />
           </div>
 
-          {/* Time filter bar */}
-          <div className="flex flex-wrap gap-2 mb-4">
-            {(
-              [
-                { key: "today", label: "Heute" },
-                { key: "24h", label: "Letzte 24h" },
-                { key: "yesterday", label: "Gestern" },
-                { key: "tomorrow", label: "Morgen" },
-                { key: "sunwindow", label: "☀ Sonnenfenster" },
-              ] as { key: FilterMode; label: string }[]
-            ).map(({ key, label }) => (
+          {/* Time filter bar: Zeitraum (Segmente) + Sonnenfenster (Zuschnitt-Schalter) */}
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <div
+              role="radiogroup"
+              aria-label="Zeitraum"
+              className="grid w-full grid-cols-4 gap-1 rounded-full bg-slate-800 p-1 sm:inline-flex sm:w-auto"
+            >
+              {(
+                [
+                  { key: "today", label: "Heute" },
+                  { key: "24h", label: "Letzte 24h" },
+                  { key: "yesterday", label: "Gestern" },
+                  { key: "tomorrow", label: "Morgen" },
+                ] as { key: FilterMode; label: string }[]
+              ).map(({ key, label }) => (
+                <button
+                  key={key}
+                  type="button"
+                  role="radio"
+                  aria-checked={activeFilter === key}
+                  onClick={() => handleFilterChange(key)}
+                  className={`px-2 sm:px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap transition-colors ${
+                    activeFilter === key
+                      ? "bg-amber-400 text-slate-900"
+                      : "text-slate-300 hover:bg-slate-700 hover:text-white"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            <div
+              title={
+                activeFilter === "24h"
+                  ? "Bei „Letzte 24h“ nicht verfügbar"
+                  : "Diagramm auf die Stunden mit erwarteter PV-Erzeugung beschränken"
+              }
+              className={`flex items-center gap-2 text-sm select-none ${
+                activeFilter === "24h" ? "opacity-40" : ""
+              }`}
+            >
+              <Sun
+                size={16}
+                className={sunWindow && activeFilter !== "24h" ? "text-amber-400" : "text-slate-500"}
+              />
+              <span
+                id="sunwindow-label"
+                className={sunWindow && activeFilter !== "24h" ? "text-slate-200" : "text-slate-400"}
+              >
+                Nur Sonnenfenster
+              </span>
               <button
-                key={key}
-                onClick={() => handleFilterChange(key)}
-                className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${
-                  activeFilter === key
-                    ? "bg-amber-400 text-slate-900"
-                    : "bg-slate-700 text-slate-300 hover:bg-slate-600 hover:text-white"
+                type="button"
+                role="switch"
+                aria-checked={sunWindow && activeFilter !== "24h"}
+                aria-labelledby="sunwindow-label"
+                disabled={activeFilter === "24h"}
+                onClick={() => handleSunWindowChange(!sunWindow)}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 disabled:cursor-not-allowed ${
+                  sunWindow && activeFilter !== "24h" ? "bg-amber-400" : "bg-slate-600"
                 }`}
               >
-                {label}
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                    sunWindow && activeFilter !== "24h" ? "translate-x-[18px]" : "translate-x-[3px]"
+                  }`}
+                />
               </button>
-            ))}
+            </div>
           </div>
 
           {/* Energy summary */}
