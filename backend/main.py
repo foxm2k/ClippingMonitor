@@ -171,7 +171,8 @@ async def _process_battery_health(powerflow_raw: dict) -> None:
     # Schreibfehlern puffern und im naechsten Zyklus in Reihenfolge nachholen.
     for ev in events:
         logger.info("Batterie-Ereignis [%s] %s", ev.severity, ev.message)
-        _pending_battery_events.append(asdict(ev))
+        # Zeitpunkt des Auftretens mitspeichern – "created" ist bei Nachtraegen der Schreibzeitpunkt
+        _pending_battery_events.append({**asdict(ev), "occurred_at": snapshot.get("timestamp")})
     overflow = len(_pending_battery_events) - PENDING_BATTERY_EVENTS_MAX
     if overflow > 0:
         logger.warning(
@@ -565,12 +566,12 @@ async def get_battery_events(limit: int = Query(default=50, ge=1, le=200)):
         pb = PocketBase(POCKETBASE_URL)
         result = await asyncio.to_thread(
             pb.collection("battery_events").get_list,
-            1, limit, {"sort": "-created", "skipTotal": 1},
+            1, limit, {"sort": "-occurred_at,-created", "skipTotal": 1},
         )
         return [
             {
                 "id": r.id,
-                "created": _format_created(r.created),
+                "created": _format_created(r.occurred_at or r.created),
                 "category": r.category,
                 "severity": r.severity,
                 "message": r.message,
