@@ -1,0 +1,8 @@
+{
+  "Body": {
+    "Data": {
+      "Inverters": { "1": { "Battery_Mode": "normal", "SOC": 4.9 } },
+      "Site": { "BatteryStandby": true, "BackupMode": false, "P_Akku": 1089.0 }
+    }
+  }
+}

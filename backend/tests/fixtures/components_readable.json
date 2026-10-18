@@ -1,0 +1,64 @@
+{
+  "Body": {
+    "Data": {
+      "Fronius_Storage_test": {
+        "attributes": {
+          "device-class": "Storage",
+          "[ENABLE]": "true",
+          "nameplate": "{\"capacity_wh\":15795,\"tCellMax\":56.0,\"tCellMin\":-20.0}"
+        },
+        "channels": {
+          "BAT_CURRENT_DC_F64": 4.0,
+          "BAT_ENERGYACTIVE_LIFETIME_CHARGED_F64": 11683609200.0,
+          "BAT_ENERGYACTIVE_LIFETIME_DISCHARGED_F64": 10896404400.0,
+          "BAT_MODE_CELL_STATE_U16": 3.0,
+          "BAT_MODE_STATUS_BATTERY_U32": 131072.0,
+          "BAT_MODE_STATUS_BMS_U32": 2.0,
+          "BAT_TEMPERATURE_CELL_F64": 20.0,
+          "BAT_TEMPERATURE_CELL_MAX_F64": 20.8,
+          "BAT_TEMPERATURE_CELL_MIN_F64": 19.3,
+          "BAT_VALUE_STATE_OF_CHARGE_RELATIVE_F32": 15.800000190734863,
+          "BAT_VALUE_STATE_OF_HEALTH_RELATIVE_U16": 99.0,
+          "BAT_VOLTAGE_DC_INTERNAL_F64": 531.3,
+          "DEVICE_TEMPERATURE_AMBIENTEMEAN_F32": 28.600000381469727
+        }
+      },
+      "Fronius_BatteryStack_test": {
+        "attributes": { "device-class": "BatteryStack", "[ENABLE]": "true" },
+        "channels": {
+          "BATSTACK_PERCENT_SOH_F32": 99.69999694824219,
+          "BATSTACK_VALUE_STATE_FLAGS_U16": 176.0
+        }
+      },
+      "Fronius_BatteryModule_a": {
+        "attributes": { "device-class": "BatteryModule", "[ENABLE]": "true" },
+        "channels": {
+          "BATMODULE_VOLTAGE_CELL_MIN_F32": 3.313,
+          "BATMODULE_VOLTAGE_CELL_MAX_F32": 3.322
+        }
+      },
+      "Fronius_BatteryModule_b": {
+        "attributes": { "device-class": "BatteryModule", "[ENABLE]": "true" },
+        "channels": {
+          "BATMODULE_VOLTAGE_CELL_MIN_F32": 3.316,
+          "BATMODULE_VOLTAGE_CELL_MAX_F32": 3.319
+        }
+      },
+      "Fronius_BatteryModule_getauscht": {
+        "attributes": { "device-class": "BatteryModule", "[ENABLE]": "false" },
+        "channels": null
+      },
+      "Fronius_BatteryModule_deaktiviert": {
+        "attributes": { "device-class": "BatteryModule", "[ENABLE]": "false" },
+        "channels": {
+          "BATMODULE_VOLTAGE_CELL_MIN_F32": 3.0,
+          "BATMODULE_VOLTAGE_CELL_MAX_F32": 3.5
+        }
+      },
+      "Fronius_Inverter_test": {
+        "attributes": { "model": "Fronius Gen24" },
+        "channels": { "BAT_MODE_ENFORCED_U16": 0.0 }
+      }
+    }
+  }
+}

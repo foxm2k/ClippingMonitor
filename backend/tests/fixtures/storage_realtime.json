@@ -1,0 +1,19 @@
+{
+  "Body": {
+    "Data": {
+      "0": {
+        "Controller": {
+          "Capacity_Maximum": 15795.0,
+          "Current_DC": -1.9,
+          "DesignedCapacity": 15795.0,
+          "Enable": 1,
+          "StateOfCharge_Relative": 4.9000000953674316,
+          "Status_BatteryCell": 3.0,
+          "Temperature_Cell": 19.5,
+          "Voltage_DC": 510.0
+        },
+        "Modules": []
+      }
+    }
+  }
+}
