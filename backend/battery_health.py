@@ -484,14 +484,17 @@ _failing: set[str] = set()
 
 
 def _note_failure(target: str, error: Exception, hint: str = "") -> None:
-    text = f"{type(error).__name__}: {str(error)[:120]}"
+    first_line = (str(error).splitlines() or [""])[0][:120]
+    text = f"{type(error).__name__}: {first_line}"
     level = logging.DEBUG if target in _failing else logging.WARNING
     _failing.add(target)
     logger.log(level, "%s nicht nutzbar (%s)%s", target, text, hint)
 
 
 def _note_success(target: str) -> None:
-    _failing.discard(target)
+    if target in _failing:
+        _failing.discard(target)
+        logger.info("%s wieder erreichbar", target)
 
 
 async def _get_json(client: httpx.AsyncClient, url: str) -> dict:
@@ -514,6 +517,9 @@ async def fetch_battery_health(
         health = parse_components(await _get_json(client, base_url + COMPONENTS_PATH))
         source = "components"
         _note_success("Komponenten-API")
+        # Fallback wird nicht abgefragt – alten Fehlerstatus verwerfen, damit der
+        # naechste Ausfall wieder als WARNING auftaucht.
+        _failing.discard("Solar-API-Speicherdaten")
     except Exception as e:
         _note_failure("Komponenten-API", e, " – versuche Solar API")
         try:

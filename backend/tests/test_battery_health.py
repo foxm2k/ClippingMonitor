@@ -1,11 +1,13 @@
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
 import pytest
 
+import battery_health
 from battery_health import (
     COMPONENTS_PATH,
     DB_FIELDS,
@@ -26,6 +28,14 @@ from battery_health import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def reset_failure_state():
+    """_failing ist modulglobal – nicht zwischen Tests durchsickern lassen."""
+    battery_health._failing.clear()
+    yield
+    battery_health._failing.clear()
 
 
 def load(name: str) -> dict:
@@ -566,3 +576,56 @@ def test_fetch_never_raises_on_malformed_powerflow(pf):
     assert s["source"] == "components"
     assert s["battery_mode"] is None
     assert set(DB_FIELDS) <= set(s)
+
+
+# ---------------------------------------------------------------------------
+# Logging des Fehlerstatus
+# ---------------------------------------------------------------------------
+
+def _log_levels(caplog, start: int) -> list[tuple[int, str]]:
+    return [(r.levelno, r.getMessage()) for r in caplog.records[start:]]
+
+
+def test_failures_log_warning_once_then_debug_and_recover(caplog):
+    caplog.set_level(logging.DEBUG, logger="battery_health")
+    ok = {
+        COMPONENTS_PATH: (200, load("components_readable.json")),
+        INVERTER_INFO_PATH: (200, load("inverter_info.json")),
+    }
+    targets = ("Komponenten-API", "Solar-API-Speicherdaten", "WR-Info")
+
+    # 1. Ausfall: alle drei als WARNING
+    run_fetch({})
+    warnings = [m for lvl, m in _log_levels(caplog, 0) if lvl == logging.WARNING]
+    assert len(warnings) == 3
+    assert all(any(t in m for m in warnings) for t in targets)
+
+    # 2. Ausfall: nur noch DEBUG
+    mark = len(caplog.records)
+    run_fetch({})
+    second = _log_levels(caplog, mark)
+    assert second and all(lvl == logging.DEBUG for lvl, _ in second)
+
+    # Komponenten-API wieder da: INFO fuer Komponenten-API und WR-Info
+    mark = len(caplog.records)
+    run_fetch(ok)
+    recovered = _log_levels(caplog, mark)
+    assert all(lvl == logging.INFO for lvl, _ in recovered)
+    assert {t for t in targets if any(t in m for _, m in recovered)} == {"Komponenten-API", "WR-Info"}
+    assert "Solar-API-Speicherdaten" not in battery_health._failing
+
+    # erneuter Ausfall: wieder ALLE drei als WARNING, auch die Solar API
+    mark = len(caplog.records)
+    run_fetch({})
+    again = [m for lvl, m in _log_levels(caplog, mark) if lvl == logging.WARNING]
+    assert len(again) == 3
+    assert all(any(t in m for m in again) for t in targets)
+
+
+def test_failure_log_uses_first_line_only(caplog):
+    caplog.set_level(logging.DEBUG, logger="battery_health")
+    battery_health._note_failure("Ziel", RuntimeError("erste Zeile" + chr(10) + "zweite Zeile mit http://wr/pfad"))
+    message = caplog.records[-1].getMessage()
+    assert "erste Zeile" in message
+    assert "zweite" not in message
+    battery_health._note_failure("Ziel2", RuntimeError(""))  # leere Meldung darf nicht scheitern
